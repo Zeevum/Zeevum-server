@@ -66,7 +66,7 @@ pub fn get_db_path() -> Result<PathBuf> {
             PathBuf::from(home).join(".local/share")
         }
     };
-    let db_dir = base_dir.join("Zeerck Inc").join("MUC-server").join("db");
+    let db_dir = base_dir.join("Zeevum").join("Zeevum-server").join("db");
     Ok(db_dir.join("database.sqlite"))
 }
 

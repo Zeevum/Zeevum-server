@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "MUC-server"
-version = "0.2.0"
+name = "Zeevum-server"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",

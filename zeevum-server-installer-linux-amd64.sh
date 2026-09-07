@@ -1,16 +1,16 @@
 #!/bin/bash
 
-APP_USER="muc-server"
-INSTALL_DIR="/opt/muc-server"
-CONFIG_DIR="/etc/muc-server"
-DATA_DIR="/var/lib/muc-server"
-SERVICE_FILE="/etc/systemd/system/muc-server.service"
-ENV_FILE="$CONFIG_DIR/muc-server.env"
-BIN_FILE="$INSTALL_DIR/MUC-server"
+APP_USER="zeevum-server"
+INSTALL_DIR="/opt/zeevum-server"
+CONFIG_DIR="/etc/zeevum-server"
+DATA_DIR="/var/lib/zeevum-server"
+SERVICE_FILE="/etc/systemd/system/zeevum-server.service"
+ENV_FILE="$CONFIG_DIR/zeevum-server.env"
+BIN_FILE="$INSTALL_DIR/Zeevum-server"
 
 REQUIRED_VARS=("TLS_CERT_PATH" "TLS_KEY_PATH")
 
-DOWNLOAD_URL="https://github.com/Zeerck/MUC-server/releases/latest/download/MUC-server-linux-amd64.tar.gz"
+DOWNLOAD_URL="https://github.com/Zeevum/Zeevum-server/releases/latest/download/Zeevum-server-linux-amd64.tar.gz"
 CHANNEL_LABEL="stable"
 
 if [ "$1" == "--pre-release" ] || [ "$1" == "--tag" ]; then
@@ -24,7 +24,7 @@ if [ "$1" == "--pre-release" ] || [ "$1" == "--tag" ]; then
         v*) : ;;
         *) echo "Tag must start with 'v' (got: ${RELEASE_TAG})" >&2; exit 1 ;;
     esac
-    DOWNLOAD_URL="https://github.com/Zeerck/MUC-server/releases/download/${RELEASE_TAG}/MUC-server-linux-amd64.tar.gz"
+    DOWNLOAD_URL="https://github.com/Zeevum/Zeevum-server/releases/download/${RELEASE_TAG}/Zeevum-server-linux-amd64.tar.gz"
     CHANNEL_LABEL="${RELEASE_TAG}"
     if [ "$MODE" == "--pre-release" ]; then
         CHANNEL_LABEL="PRE-RELEASE ${RELEASE_TAG} (testing build)"
@@ -66,10 +66,10 @@ grant_cert_access() {
 }
 
 if [ "$1" == "--remove" ]; then
-    print_warning "Deleting MUC-server..."
+    print_warning "Deleting Zeevum-server..."
     
-    systemctl stop muc-server 2>/dev/null
-    systemctl disable muc-server 2>/dev/null
+    systemctl stop zeevum-server 2>/dev/null
+    systemctl disable zeevum-server 2>/dev/null
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
@@ -79,20 +79,20 @@ if [ "$1" == "--remove" ]; then
     if [[ "$del_data" =~ ^[Yy]$ ]]; then
         rm -rf "$CONFIG_DIR" "$DATA_DIR"
         userdel "$APP_USER" 2>/dev/null
-        print_message "MUC-server deleted completely."
+        print_message "Zeevum-server deleted completely."
     else
-        print_message "MUC-server deleted. Configs and settings saved in $DATA_DIR and $CONFIG_DIR"
+        print_message "Zeevum-server deleted. Configs and settings saved in $DATA_DIR and $CONFIG_DIR"
     fi
     exit 0
 fi
 
 if [ "$EUID" -ne 0 ]; then
-    print_error "Please run this script using: sudo bash muc-server-installer.sh"
+    print_error "Please run this script using: sudo bash zeevum-server-installer.sh"
     exit 1
 fi
 
 if [ -f "$SERVICE_FILE" ]; then
-    print_warning "MUC-server is already installed. Starting UPDATE mode..."
+    print_warning "Zeevum-server is already installed. Starting UPDATE mode..."
     
     for var in "${REQUIRED_VARS[@]}"; do
         if ! grep -q "^${var}=." "$ENV_FILE"; then
@@ -141,7 +141,7 @@ if [ -f "$SERVICE_FILE" ]; then
     print_message "Certificate permissions verified."
 
     print_message "Stopping service for update..."
-    systemctl stop muc-server
+    systemctl stop zeevum-server
     
     print_message "Backing up old binary..."
     cp "$BIN_FILE" "${BIN_FILE}.bak"
@@ -152,22 +152,22 @@ if [ -f "$SERVICE_FILE" ]; then
         apt install wget -y
     fi
     
-    wget -qO /tmp/muc-server.tar.gz "$DOWNLOAD_URL"
+    wget -qO /tmp/zeevum-server.tar.gz "$DOWNLOAD_URL"
     if [ $? -ne 0 ]; then
         print_error "Error while downloading. Check URL: $DOWNLOAD_URL"
-        rm -f /tmp/muc-server.tar.gz
+        rm -f /tmp/zeevum-server.tar.gz
         exit 1
     fi
     
-    tar -xzf /tmp/muc-server.tar.gz -C "$INSTALL_DIR"
-    rm /tmp/muc-server.tar.gz
+    tar -xzf /tmp/zeevum-server.tar.gz -C "$INSTALL_DIR"
+    rm /tmp/zeevum-server.tar.gz
     
     if [ ! -f "$BIN_FILE" ]; then
-        BIN_FILE=$(find "$INSTALL_DIR" -type f -name "MUC-server" | head -n 1)
+        BIN_FILE=$(find "$INSTALL_DIR" -type f -name "Zeevum-server" | head -n 1)
     fi
     
     if [ -z "$BIN_FILE" ]; then
-        print_error "MUC-server binary file not found in archive! Restoring backup."
+        print_error "Zeevum-server binary file not found in archive! Restoring backup."
         mv "${BIN_FILE}.bak" "$BIN_FILE"
         exit 1
     fi
@@ -176,23 +176,23 @@ if [ -f "$SERVICE_FILE" ]; then
     chown -R "$APP_USER":"$APP_USER" "$INSTALL_DIR"
     
     print_message "Starting updated service..."
-    systemctl start muc-server
+    systemctl start zeevum-server
     sleep 3
     
-    if systemctl is-active --quiet muc-server; then
+    if systemctl is-active --quiet zeevum-server; then
         print_message "Update complete! Backup removed."
         rm -f "${BIN_FILE}.bak"
     else
         print_error "Service failed to start after update!"
         print_error "Restoring previous binary..."
         mv "${BIN_FILE}.bak" "$BIN_FILE"
-        systemctl start muc-server
-        print_warning "Rolled back to previous version. Please check logs: journalctl -u muc-server -e"
+        systemctl start zeevum-server
+        print_warning "Rolled back to previous version. Please check logs: journalctl -u zeevum-server -e"
     fi
     exit 0
 fi
 
-print_message "Installing MUC-server..."
+print_message "Installing Zeevum-server..."
 
 if id "$APP_USER" &>/dev/null; then
     print_warning "User $APP_USER already exists. Skipping creating new user."
@@ -229,9 +229,9 @@ printf "%s[?]%s Server address:port [0.0.0.0:1990]: " "$YELLOW" "$NC"
 read server_addr
 server_addr=${server_addr:-"0.0.0.0:1990"}
 
-printf "%s[?]%s Path where DB will be placed [/var/lib/muc-server/database.sqlite]: " "$YELLOW" "$NC"
+printf "%s[?]%s Path where DB will be placed [/var/lib/zeevum-server/database.sqlite]: " "$YELLOW" "$NC"
 read db_path
-db_path=${db_path:-"/var/lib/muc-server/database.sqlite"}
+db_path=${db_path:-"/var/lib/zeevum-server/database.sqlite"}
 
 printf "%s[?]%s Read timeout [300]: " "$YELLOW" "$NC"
 read read_timeout
@@ -269,21 +269,21 @@ if ! command -v wget &> /dev/null; then
     apt install wget -y
 fi
 
-wget -qO /tmp/muc-server.tar.gz "$DOWNLOAD_URL"
+wget -qO /tmp/zeevum-server.tar.gz "$DOWNLOAD_URL"
 if [ $? -ne 0 ]; then
     print_error "Error while downloading. Check URL: $DOWNLOAD_URL"
     exit 1
 fi
 
-tar -xzf /tmp/muc-server.tar.gz -C "$INSTALL_DIR"
-rm /tmp/muc-server.tar.gz
+tar -xzf /tmp/zeevum-server.tar.gz -C "$INSTALL_DIR"
+rm /tmp/zeevum-server.tar.gz
 
 if [ ! -f "$BIN_FILE" ]; then
-    BIN_FILE=$(find "$INSTALL_DIR" -type f -name "MUC-server" | head -n 1)
+    BIN_FILE=$(find "$INSTALL_DIR" -type f -name "Zeevum-server" | head -n 1)
 fi
 
 if [ -z "$BIN_FILE" ]; then
-    print_error "MUC-server binary file not found!"
+    print_error "Zeevum-server binary file not found!"
     exit 1
 fi
 
@@ -294,7 +294,7 @@ chown -R "$APP_USER":"$APP_USER" "$DATA_DIR"
 print_message "Creating systemd service..."
 cat <<EOF > "$SERVICE_FILE"
 [Unit]
-Description=MUC Server
+Description=Zeevum Server
 After=network.target
 
 [Service]
@@ -317,11 +317,11 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable muc-server
-systemctl start muc-server
+systemctl enable zeevum-server
+systemctl start zeevum-server
 
 print_message "Installation complete!"
 echo -e "${CYAN}========================================${NC}"
-systemctl status muc-server --no-pager
+systemctl status zeevum-server --no-pager
 echo -e "${CYAN}========================================${NC}"
-print_warning "If the service did not launch, check logs: journalctl -u muc-server -e"
+print_warning "If the service did not launch, check logs: journalctl -u zeevum-server -e"

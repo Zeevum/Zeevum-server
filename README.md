@@ -1,4 +1,4 @@
-# MUC-server
+# Zeevum-server
 Безопасный многопользовательский чат-сервер на Rust с управлением пользователями через SQLite и сквозным шифрованием TLS (Требуется сертификат)
 
 ## Возможности проекта
@@ -21,8 +21,8 @@
 ## Установка и запуск (Для разработки)
 1. Клонируем репозиторий:
 ```bash
-git clone https://github.com/Zeerck/MUC-server.git
-cd MUC-server
+git clone https://github.com/Zeevum/Zeevum-server.git
+cd Zeevum-server
 ```
 
 2. Копируем пример конфигурации:
@@ -49,17 +49,17 @@ cp .env.example .env
 
 ## Деплой на Linux
 Для автоматической установки сервера как systemd-сервиса используйте установочный скрипт.
-1. Скачайте скрипт `muc-server-installer-linux-amd64.sh` на ваш сервер
+1. Скачайте скрипт `zeevum-server-installer-linux-amd64.sh` на ваш сервер
     ```
-    wget https://github.com/Zeerck/MUC-server/releases/latest/download/muc-server-installer-linux-amd64.sh
+    wget https://github.com/Zeevum/Zeevum-server/releases/latest/download/zeevum-server-installer-linux-amd64.sh
     ```
 2. Запустите его от имени `root`:
     ```
-    sudo bash muc-server-installer-linux-amd64.sh
+    sudo bash zeevum-server-installer-linux-amd64.sh
     ```
 
 Скрипт:
-- Создаст системного пользователя `muc-server`.
+- Создаст системного пользователя `zeevum-server`.
 - Запросит пути к сертификатам и другие настройки.
 - Настроит права доступа (ACL) к сертификатам.
 - Скачает последний релиз с GitHub.
@@ -75,7 +75,7 @@ cp .env.example .env
 | `READ_TIMEOUT`	| Таймаут чтения сообщений после авторизации (сек) |	300 |
 | `HANDSHAKE_TIMEOUT`	| Таймаут TLS и Auth рукопожатия при подключении (сек)	| 10 |
 
-> При использовании установщика, переменные HOME и XDG_DATA_HOME автоматически направляются в /var/lib/muc-server, чтобы логгер имел права на запись.
+> При использовании установщика, переменные HOME и XDG_DATA_HOME автоматически направляются в /var/lib/zeevum-server, чтобы логгер имел права на запись.
 
 ## Команды клиента
 - `/ping` – получить от сервера ответ `PONG`

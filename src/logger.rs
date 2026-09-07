@@ -119,7 +119,7 @@ fn get_log_dir(app_name: &str) -> PathBuf {
         }
     };
 
-    base_dir.join("Zeerck Inc").join(app_name).join("logs")
+    base_dir.join("Zeevum").join(app_name).join("logs")
 }
 
 pub fn log(content: String, level: LogLevel) {

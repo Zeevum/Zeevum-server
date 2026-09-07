@@ -29,21 +29,21 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: |
           mkdir -p staging
-          cp target/release/MUC-server staging/
-          tar -czf muc-server-linux-amd64.tar.gz -C staging .
+          cp target/release/Zeevum-server staging/
+          tar -czf zeevum-server-linux-amd64.tar.gz -C staging .
 
       - name: Prepare artifacts (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           mkdir staging
-          copy target\release\MUC-server.exe staging\
-          Compress-Archive -Path staging\* -DestinationPath muc-server-windows-x64.zip
+          copy target\release\Zeevum-server.exe staging\
+          Compress-Archive -Path staging\* -DestinationPath zeevum-server-windows-x64.zip
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            muc-server-linux-amd64.tar.gz
-            muc-server-windows-x64.zip
-            muc-server-installer-linux-amd64.sh
+            zeevum-server-linux-amd64.tar.gz
+            zeevum-server-windows-x64.zip
+            zeevum-server-installer-linux-amd64.sh
           prerelease: ${{ contains(github.ref_name, '-') }}

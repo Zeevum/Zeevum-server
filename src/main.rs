@@ -94,8 +94,8 @@ fn load_tls_config() -> Arc<ServerConfig> {
 async fn main() {
     dotenv().ok();
     rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
-    logger::init("MUC-server", CONFIG.log_level);
-    info!("MUC-server v{} starting", env!("CARGO_PKG_VERSION"));
+    logger::init("Zeevum-server", CONFIG.log_level);
+    info!("Zeevum-server v{} starting", env!("CARGO_PKG_VERSION"));
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
