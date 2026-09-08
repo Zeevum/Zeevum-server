@@ -77,8 +77,8 @@ sudo bash zeevum-server-installer-linux-amd64.sh
 
 Повторный запуск скрипта — это режим обновления: бэкап бинарника, загрузка новой версии, откат при неудачном старте новой версии
 
-### Команды установщика:
-| Команда | Описание |
+### Параметры установщика:
+| Команда с параметрами | Описание |
 |---|---|
 | `sudo bash zeevum-server-installer-linux-amd64.sh --tag v0.2.0`                | Конкретная стабильная версия |
 | `sudo bash zeevum-server-installer-linux-amd64.sh --pre-release v0.2.0-rc.1` | Конкретный pre-release |
