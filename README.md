@@ -31,7 +31,7 @@ git clone https://github.com/Zeevum/Zeevum-server.git
 cd Zeevum-server
 cp .env.example .env
 cargo test
-cargo run
+cargo run --release
 ```
 Для локального TLS удобно использовать mkcert:
 `mkcert -install && mkcert -cert-file certs/localhost.crt -key-file certs/localhost.crt.key localhost 127.0.0.1 ::1`
