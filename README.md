@@ -4,7 +4,7 @@
 ## Возможности проекта
 - TLS (rustls, TLS 1.2/1.3): весь трафик зашифрован. Подходят сертификаты Let's Encrypt (`.pem`, `.crt` и `.crt.key`)
 - Регистрация с Proof-of-Work и проверкой стойкости пароля
-- Вход по логину и паролю, автоматическое продление сессии
+- Вход по логину и паролю, autologin (автоматический вход по токену), автоматическое продление сессии
 - Друзья: поиск по логину, заявки, принятие
 - Приватные чаты (пока что пользователь-пользователь, без групп и общих чатов)
 - Статусы прочтения сообщений
@@ -69,7 +69,7 @@ POW_DIFFICULTY=medium
 ## Деплой на Linux
 Установщик из раздела Releases устанавливает сервер как systemd-сервис (***Требуются root права***):
 ```bash
-wget https://github.com/Zeevum/Zeevum-server/releases/latests/download/zeevum-server-installer-linux-amd64.sh
+wget https://github.com/Zeevum/Zeevum-server/releases/latest/download/zeevum-server-installer-linux-amd64.sh
 chmod +x zeevum-server-installer-linux-amd64.sh
 sudo bash zeevum-server-installer-linux-amd64.sh
 ```
@@ -99,3 +99,6 @@ sudo bash zeevum-server-installer-linux-amd64.sh
 ## Протокол
 Описание формата, типы сообщений и версии совместимости находятся в репозитории [Zeevum-protocol](https://github.com/Zeevum/Zeevum-protocol).
 > Текущая версия протокола: 1
+
+## Лицензия
+[MIT](LICENSE)
