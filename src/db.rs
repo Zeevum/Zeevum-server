@@ -309,15 +309,19 @@ pub async fn save_chat_message(
     Ok(())
 }
 
-pub async fn get_chat_history(pool: &SqlitePool, chat_id: &Uuid, limit: i64) -> Result<Vec<(Uuid, Uuid, String, i64)>> {
+pub async fn get_chat_history(
+    pool: &SqlitePool,
+    chat_id: &Uuid,
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid, String, i64, bool)>> {
     let rows = sqlx::query_as(
-        "SELECT id, sender_id, content, timestamp FROM messages
-            WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?"
+        "SELECT id, `sender_id`, content, timestamp, is_read FROM messages
+            WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?",
     )
-    .bind(chat_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+        .bind(chat_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows)
 }

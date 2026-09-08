@@ -1,4 +1,5 @@
 use crate::{db, logger, trace};
+use Zeevum_protocol::pow::Difficulty;
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Debug)]
@@ -9,7 +10,7 @@ pub struct Config {
     pub handshake_timeout: Duration,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
-    pub pow_difficulty: usize,
+    pub pow_difficulty: Difficulty,
     pub session_duration_hours: f64,
     pub log_level: logger::LogLevel,
 }
@@ -40,7 +41,7 @@ impl Config {
             .filter(|&t| t > 0)
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(10));
-        
+
         let tls_cert_path = env::var("TLS_CERT_PATH")
             .map(PathBuf::from)
             .expect("TLS_CERT_PATH variable is required");
@@ -54,12 +55,10 @@ impl Config {
                 trace!("Environment parameter 'POW_DIFFICULTY' not found. Default value will be used: medium");
                 "medium".to_string()
             });
-        let pow_difficulty = match bot_secure_level.to_lowercase().as_str() {
-            "weak" => 4,
-            "medium" => 5,
-            "strong" => 6,
-            _ => 5,
-        };
+        let pow_difficulty = Difficulty::parse_env(&bot_secure_level).unwrap_or_else(|| {
+            eprintln!("Unknown POW_DIFFICULTY value '{bot_secure_level}', falling back to medium");
+            Difficulty::Medium
+        });
 
         let session_duration_hours = env::var("SESSION_DURATION_HOURS")
             .ok()
