@@ -7,13 +7,13 @@ use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 pub enum LogLevel {
     Trace,
     Debug,
     Info,
     Warning,
     Error,
+    #[allow(dead_code)]
     Fatal,
 }
 
@@ -173,7 +173,6 @@ macro_rules! error {
 }
 
 #[macro_export]
-#[allow(dead_code)]
 macro_rules! fatal {
     ($($arg:tt)*) => {
         $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Fatal)

@@ -18,12 +18,12 @@ use uuid::Uuid;
 use zxcvbn::Score;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct User {
     pub id: Uuid,
     pub chat_id: i64,
     pub login: String,
     pub password: String,
+    #[allow(dead_code)]
     pub created_at: DateTime<Local>,
 }
 
