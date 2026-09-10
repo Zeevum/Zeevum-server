@@ -21,10 +21,10 @@ impl Hub {
 
     pub fn unregister_if(&self, chat_id: i64, tx: &ClientTx) {
         let mut users = self.users.lock().unwrap();
-        if let Some(current) = users.get(&chat_id) {
-            if current.same_channel(tx) {
-                users.remove(&chat_id);
-            }
+        if let Some(current) = users.get(&chat_id)
+            && current.same_channel(tx)
+        {
+            users.remove(&chat_id);
         }
     }
 

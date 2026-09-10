@@ -66,7 +66,11 @@ impl Config {
             .filter(|&t| t > 0.0)
             .unwrap_or(720.0);
 
-        let log_level = match env::var("LOG_LEVEL").unwrap_or_default().to_uppercase().as_str() {
+        let log_level = match env::var("LOG_LEVEL")
+            .unwrap_or_default()
+            .to_uppercase()
+            .as_str()
+        {
             "TRACE" => logger::LogLevel::Trace,
             "DEBUG" => logger::LogLevel::Debug,
             "INFO" | "" => logger::LogLevel::Info,
