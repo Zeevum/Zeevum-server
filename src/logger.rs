@@ -81,9 +81,10 @@ pub fn init(app_name: &str, min_level: LogLevel) {
                 let file_line = format!("[{:<5}] {} - {}", entry.level, timestamp, entry.content);
 
                 if let Some(f) = file.as_mut()
-                    && let Err(e) = writeln!(f, "{}", file_line) {
-                        eprintln!("Failed to write to log file: {e}");
-                    }
+                    && let Err(e) = writeln!(f, "{}", file_line)
+                {
+                    eprintln!("Failed to write to log file: {e}");
+                }
 
                 let console_str = format!(
                     "[{:<5}] {} - {}",
@@ -124,9 +125,10 @@ fn get_log_dir(app_name: &str) -> PathBuf {
 
 pub fn log(content: String, level: LogLevel) {
     if let Some(min_level) = LOG_LEVEL.get()
-        && level < *min_level {
-            return;
-        }
+        && level < *min_level
+    {
+        return;
+    }
 
     if let Some(sender) = LOG_SENDER.get() {
         let _ = sender.send(LogEntry { level, content });

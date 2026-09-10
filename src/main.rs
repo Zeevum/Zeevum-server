@@ -426,33 +426,32 @@ async fn handle_client(
                             db::get_user_by_chat_id(&pool, &peer_chat_id).await
                             && let Ok(chat_id) =
                                 db::get_or_create_private_chat(&pool, &user_id, &target.id).await
-                                && let Ok(history) = db::get_chat_history(
-                                    &pool,
-                                    &chat_id,
-                                    Zeevum_protocol::HISTORY_LIMIT,
-                                )
-                                .await
-                                {
-                                    for (msg_id, sender_id, content, ts, is_read) in history {
-                                        let sender_chat_id = if sender_id == user_id {
-                                            user_chat_id
-                                        } else {
-                                            target.chat_id
-                                        };
-                                        let _ = hub.send_to(
-                                            user_chat_id,
-                                            &frame(&ServerMsg::HistoryMsg {
-                                                message_id: msg_id,
-                                                sender_chat_id,
-                                                timestamp: ts,
-                                                content,
-                                                is_read,
-                                            }),
-                                        );
-                                    }
-                                    let _ =
-                                        hub.send_to(user_chat_id, &frame(&ServerMsg::HistoryEnd));
-                                }
+                            && let Ok(history) = db::get_chat_history(
+                                &pool,
+                                &chat_id,
+                                Zeevum_protocol::HISTORY_LIMIT,
+                            )
+                            .await
+                        {
+                            for (msg_id, sender_id, content, ts, is_read) in history {
+                                let sender_chat_id = if sender_id == user_id {
+                                    user_chat_id
+                                } else {
+                                    target.chat_id
+                                };
+                                let _ = hub.send_to(
+                                    user_chat_id,
+                                    &frame(&ServerMsg::HistoryMsg {
+                                        message_id: msg_id,
+                                        sender_chat_id,
+                                        timestamp: ts,
+                                        content,
+                                        is_read,
+                                    }),
+                                );
+                            }
+                            let _ = hub.send_to(user_chat_id, &frame(&ServerMsg::HistoryEnd));
+                        }
                     }
                     ClientMsg::SendMsg {
                         message_id,
@@ -472,32 +471,30 @@ async fn handle_client(
                             db::get_user_by_chat_id(&pool, &peer_chat_id).await
                             && let Ok(chat_id) =
                                 db::get_or_create_private_chat(&pool, &user_id, &target.id).await
-                            {
-                                let _ = db::save_chat_message(
-                                    &pool,
-                                    &message_id,
-                                    &chat_id,
-                                    &user_id,
-                                    &content,
-                                )
-                                .await;
-                                let _ = hub.send_to(
-                                    user_chat_id,
-                                    &frame(&ServerMsg::MsgAck { message_id }),
-                                );
+                        {
+                            let _ = db::save_chat_message(
+                                &pool,
+                                &message_id,
+                                &chat_id,
+                                &user_id,
+                                &content,
+                            )
+                            .await;
+                            let _ = hub
+                                .send_to(user_chat_id, &frame(&ServerMsg::MsgAck { message_id }));
 
-                                let ts = chrono::Utc::now().timestamp();
-                                let _ = hub.send_to(
-                                    target.chat_id,
-                                    &frame(&ServerMsg::RecvMsg {
-                                        message_id,
-                                        chat_id,
-                                        sender_chat_id: user_chat_id,
-                                        timestamp: ts,
-                                        content,
-                                    }),
-                                );
-                            }
+                            let ts = chrono::Utc::now().timestamp();
+                            let _ = hub.send_to(
+                                target.chat_id,
+                                &frame(&ServerMsg::RecvMsg {
+                                    message_id,
+                                    chat_id,
+                                    sender_chat_id: user_chat_id,
+                                    timestamp: ts,
+                                    content,
+                                }),
+                            );
+                        }
                     }
                     ClientMsg::MarkRead { message_id } => {
                         if let Ok(Some(sender_chat_id)) =

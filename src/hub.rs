@@ -22,9 +22,10 @@ impl Hub {
     pub fn unregister_if(&self, chat_id: i64, tx: &ClientTx) {
         let mut users = self.users.lock().unwrap();
         if let Some(current) = users.get(&chat_id)
-            && current.same_channel(tx) {
-                users.remove(&chat_id);
-            }
+            && current.same_channel(tx)
+        {
+            users.remove(&chat_id);
+        }
     }
 
     pub fn send_to(&self, target_chat_id: i64, message: &str) -> bool {

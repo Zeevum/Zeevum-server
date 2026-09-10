@@ -494,8 +494,7 @@ mod tests {
     use std::str::FromStr;
 
     async fn setup_pool() -> Result<SqlitePool> {
-        let opts =
-            SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
+        let opts = SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
