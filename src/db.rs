@@ -18,6 +18,7 @@ use uuid::Uuid;
 use zxcvbn::Score;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct User {
     pub id: Uuid,
     pub chat_id: i64,
@@ -209,6 +210,7 @@ pub async fn get_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<User>>
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn delete_user(pool: &SqlitePool, id: &Uuid) -> Result<bool> {
     let rows = sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id)
@@ -220,7 +222,7 @@ pub async fn delete_user(pool: &SqlitePool, id: &Uuid) -> Result<bool> {
 
 pub fn validate_login(nick: &str) -> bool {
     let len = nick.len();
-    if len < 3 || len > 32 {
+    if !(3..=32).contains(&len) {
         return false;
     }
     nick.chars()
@@ -493,7 +495,7 @@ mod tests {
 
     async fn setup_pool() -> Result<SqlitePool> {
         let opts =
-            sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
+            SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)

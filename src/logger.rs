@@ -7,6 +7,7 @@ use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -79,11 +80,10 @@ pub fn init(app_name: &str, min_level: LogLevel) {
                 let timestamp = now.format("%Y-%m-%d %H:%M:%S.%f");
                 let file_line = format!("[{:<5}] {} - {}", entry.level, timestamp, entry.content);
 
-                if let Some(f) = file.as_mut() {
-                    if let Err(e) = writeln!(f, "{}", file_line) {
+                if let Some(f) = file.as_mut()
+                    && let Err(e) = writeln!(f, "{}", file_line) {
                         eprintln!("Failed to write to log file: {e}");
                     }
-                }
 
                 let console_str = format!(
                     "[{:<5}] {} - {}",
@@ -123,11 +123,10 @@ fn get_log_dir(app_name: &str) -> PathBuf {
 }
 
 pub fn log(content: String, level: LogLevel) {
-    if let Some(min_level) = LOG_LEVEL.get() {
-        if level < *min_level {
+    if let Some(min_level) = LOG_LEVEL.get()
+        && level < *min_level {
             return;
         }
-    }
 
     if let Some(sender) = LOG_SENDER.get() {
         let _ = sender.send(LogEntry { level, content });
@@ -172,6 +171,7 @@ macro_rules! error {
 }
 
 #[macro_export]
+#[allow(dead_code)]
 macro_rules! fatal {
     ($($arg:tt)*) => {
         $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Fatal)

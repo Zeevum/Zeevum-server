@@ -29,7 +29,7 @@ use Zeevum_protocol::{
 use crate::config::Config;
 use crate::hub::Hub;
 
-static CONFIG: LazyLock<Config> = LazyLock::new(|| Config::from_env());
+static CONFIG: LazyLock<Config> = LazyLock::new(Config::from_env);
 
 struct RateLimiter {
     attempts: HashMap<IpAddr, Vec<Instant>>,
@@ -58,7 +58,7 @@ impl RateLimiter {
     }
     fn record_failure(&mut self, ip: IpAddr) {
         let now = Instant::now();
-        let times = self.attempts.entry(ip).or_insert_with(Vec::new);
+        let times = self.attempts.entry(ip).or_default();
         times.push(now);
         times.retain(|&t| now.duration_since(t) < self.window);
     }
@@ -424,11 +424,9 @@ async fn handle_client(
                     ClientMsg::HistoryReq { peer_chat_id } => {
                         if let Ok(Some(target)) =
                             db::get_user_by_chat_id(&pool, &peer_chat_id).await
-                        {
-                            if let Ok(chat_id) =
+                            && let Ok(chat_id) =
                                 db::get_or_create_private_chat(&pool, &user_id, &target.id).await
-                            {
-                                if let Ok(history) = db::get_chat_history(
+                                && let Ok(history) = db::get_chat_history(
                                     &pool,
                                     &chat_id,
                                     Zeevum_protocol::HISTORY_LIMIT,
@@ -455,8 +453,6 @@ async fn handle_client(
                                     let _ =
                                         hub.send_to(user_chat_id, &frame(&ServerMsg::HistoryEnd));
                                 }
-                            }
-                        }
                     }
                     ClientMsg::SendMsg {
                         message_id,
@@ -474,8 +470,7 @@ async fn handle_client(
                         }
                         if let Ok(Some(target)) =
                             db::get_user_by_chat_id(&pool, &peer_chat_id).await
-                        {
-                            if let Ok(chat_id) =
+                            && let Ok(chat_id) =
                                 db::get_or_create_private_chat(&pool, &user_id, &target.id).await
                             {
                                 let _ = db::save_chat_message(
@@ -503,7 +498,6 @@ async fn handle_client(
                                     }),
                                 );
                             }
-                        }
                     }
                     ClientMsg::MarkRead { message_id } => {
                         if let Ok(Some(sender_chat_id)) =
