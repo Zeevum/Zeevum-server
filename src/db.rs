@@ -1,21 +1,21 @@
-use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Local, Utc};
-use zxcvbn::Score;
-use std::{fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH, Duration}};
-use uuid::{Uuid};
+use anyhow::{Context, Result, anyhow};
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
+use chrono::{DateTime, Local, Utc};
 use sqlx::Row;
 use sqlx::sqlite::{
-    SqliteConnectOptions,
-    SqliteJournalMode,
-    SqlitePoolOptions,
-    SqlitePool,
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
     SqliteSynchronous,
-    SqliteRow,
 };
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+use zxcvbn::Score;
 
 #[derive(Debug)]
 pub struct User {
@@ -48,9 +48,7 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
 }
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await?;
+    sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
 }
 
@@ -74,11 +72,12 @@ async fn generate_unique_chat_id(pool: &SqlitePool) -> i64 {
     loop {
         let id = (rand::random::<u32>() % 9000000 + 1000000) as i64;
 
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE chat_id = ?)")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(true);
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE chat_id = ?)")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(true);
 
         if !exists {
             return id;
@@ -99,16 +98,21 @@ pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Res
     let id = Uuid::new_v4();
     let chat_id = generate_unique_chat_id(pool).await;
     let hashed_password = hash_password(raw_password).expect("Error while hashing password!");
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before epoch").as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before epoch")
+        .as_secs() as i64;
 
-    sqlx::query("INSERT INTO users (id, chat_id, login, password, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(id)
-        .bind(chat_id)
-        .bind(login)
-        .bind(&hashed_password)
-        .bind(now)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, chat_id, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(chat_id)
+    .bind(login)
+    .bind(&hashed_password)
+    .bind(now)
+    .execute(pool)
+    .await?;
 
     Ok(User {
         id,
@@ -120,19 +124,26 @@ pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Res
 }
 
 pub async fn get_user_by_login(pool: &SqlitePool, login: &str) -> Result<Option<User>> {
-    let row = sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE login = ?")
-        .bind(login)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE login = ?")
+            .bind(login)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(user_row) = row {
-        Ok(Some(map_row_to_user(&user_row).expect("Error mapping User data")))
+        Ok(Some(
+            map_row_to_user(&user_row).expect("Error mapping User data"),
+        ))
     } else {
         Ok(None)
     }
 }
 
-pub async fn create_session(pool: &SqlitePool, user_id: Uuid, duration_hours: f64) -> Result<(String, i64)> {
+pub async fn create_session(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    duration_hours: f64,
+) -> Result<(String, i64)> {
     let token = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let expires_at = now + (duration_hours * 3600.0) as i64;
@@ -147,14 +158,19 @@ pub async fn create_session(pool: &SqlitePool, user_id: Uuid, duration_hours: f6
     Ok((token, expires_at))
 }
 
-pub async fn validate_session(pool: &SqlitePool, token: &str, duration_hours: f64) -> Result<Option<User>> {
+pub async fn validate_session(
+    pool: &SqlitePool,
+    token: &str,
+    duration_hours: f64,
+) -> Result<Option<User>> {
     let now = Utc::now().timestamp();
 
-    let session_row = sqlx::query("SELECT user_id FROM sessions WHERE token = ? AND expires_at > ?")
-        .bind(token)
-        .bind(now)
-        .fetch_optional(pool)
-        .await?;
+    let session_row =
+        sqlx::query("SELECT user_id FROM sessions WHERE token = ? AND expires_at > ?")
+            .bind(token)
+            .bind(now)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(session_row) = session_row {
         let user_id: Uuid = session_row.try_get("user_id")?;
@@ -166,10 +182,11 @@ pub async fn validate_session(pool: &SqlitePool, token: &str, duration_hours: f6
             .execute(pool)
             .await?;
 
-        let user_row = sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await?;
+        let user_row =
+            sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await?;
 
         return Ok(Some(map_row_to_user(&user_row)?));
     }
@@ -177,13 +194,16 @@ pub async fn validate_session(pool: &SqlitePool, token: &str, duration_hours: f6
 }
 
 pub async fn get_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<User>> {
-    let row = sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(user_row) = row {
-        Ok(Some(map_row_to_user(&user_row).expect("Error mapping User data")))
+        Ok(Some(
+            map_row_to_user(&user_row).expect("Error mapping User data"),
+        ))
     } else {
         Ok(None)
     }
@@ -203,7 +223,8 @@ pub fn validate_login(nick: &str) -> bool {
     if len < 3 || len > 32 {
         return false;
     }
-    nick.chars().all(|char| char.is_ascii_alphanumeric() || char == '_')
+    nick.chars()
+        .all(|char| char.is_ascii_alphanumeric() || char == '_')
 }
 
 fn map_row_to_user(row: &SqliteRow) -> Result<User> {
@@ -218,7 +239,13 @@ fn map_row_to_user(row: &SqliteRow) -> Result<User> {
     };
     let created_at = dt_utc.with_timezone(&Local);
 
-    Ok(User { id, chat_id, login, password, created_at })
+    Ok(User {
+        id,
+        chat_id,
+        login,
+        password,
+        created_at,
+    })
 }
 
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
@@ -233,7 +260,9 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-    Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
 }
 
 pub async fn get_or_create_private_chat(
@@ -252,10 +281,10 @@ pub async fn get_or_create_private_chat(
             JOIN chat_members cm2 ON c.id = cm2.chat_id AND cm2.user_id = ?
             WHERE c.type = 'private'",
     )
-        .bind(user1_id)
-        .bind(user2_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    .bind(user1_id)
+    .bind(user2_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     if let Some((chat_id,)) = existing {
         return Ok(chat_id);
@@ -318,10 +347,10 @@ pub async fn get_chat_history(
         "SELECT id, `sender_id`, content, timestamp, is_read FROM messages
             WHERE chat_id = ? ORDER BY timestamp DESC LIMIT ?",
     )
-        .bind(chat_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    .bind(chat_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows)
 }
@@ -344,11 +373,11 @@ pub async fn mark_message_as_read_checked(
          JOIN chat_members cm ON cm.chat_id = m.chat_id AND cm.user_id = ?
          WHERE m.id = ? AND m.sender_id != ?",
     )
-        .bind(reader_id)
-        .bind(message_id)
-        .bind(reader_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    .bind(reader_id)
+    .bind(message_id)
+    .bind(reader_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     let Some((sender_id,)) = row else {
         return Ok(None);
@@ -370,10 +399,11 @@ pub async fn mark_message_as_read_checked(
 }
 
 pub async fn get_user_by_chat_id(pool: &SqlitePool, chat_id: &i64) -> Result<Option<User>> {
-    let row = sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE chat_id = ?")
-        .bind(chat_id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT id, chat_id, login, password, created_at FROM users WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(user_row) = row {
         Ok(Some(map_row_to_user(&user_row)?))
@@ -382,18 +412,24 @@ pub async fn get_user_by_chat_id(pool: &SqlitePool, chat_id: &i64) -> Result<Opt
     }
 }
 
-pub async fn accept_friend_request(pool: &SqlitePool, user_id: &Uuid, friend_id: &Uuid) -> Result<()> {
+pub async fn accept_friend_request(
+    pool: &SqlitePool,
+    user_id: &Uuid,
+    friend_id: &Uuid,
+) -> Result<()> {
     sqlx::query("UPDATE friends SET status = 'accepted' WHERE user_id = ? AND friend_id = ?")
         .bind(friend_id)
         .bind(user_id)
         .execute(pool)
         .await?;
 
-    sqlx::query("INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'accepted')")
-        .bind(user_id)
-        .bind(friend_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'accepted')",
+    )
+    .bind(user_id)
+    .bind(friend_id)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -402,11 +438,11 @@ pub async fn get_friends_list(pool: &SqlitePool, user_id: &Uuid) -> Result<Vec<(
     let rows = sqlx::query(
         "SELECT u.chat_id, u.login FROM friends f
          JOIN users u ON f.friend_id = u.id
-         WHERE f.user_id = ? AND f.status = 'accepted'"
+         WHERE f.user_id = ? AND f.status = 'accepted'",
     )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await?;
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
 
     let mut friends = Vec::new();
     for row in rows {
@@ -422,7 +458,7 @@ pub async fn get_pending_requests(pool: &SqlitePool, user_id: &Uuid) -> Result<V
     let rows = sqlx::query(
         "SELECT u.chat_id, u.login FROM friends f
         JOIN users u ON f.user_id = u.id
-        WHERE f.friend_id = ? AND f.status = 'pending'"
+        WHERE f.friend_id = ? AND f.status = 'pending'",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -439,11 +475,13 @@ pub async fn get_pending_requests(pool: &SqlitePool, user_id: &Uuid) -> Result<V
 }
 
 pub async fn add_friend_request(pool: &SqlitePool, user_id: &Uuid, friend_id: &Uuid) -> Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')")
-        .bind(user_id)
-        .bind(friend_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')",
+    )
+    .bind(user_id)
+    .bind(friend_id)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -454,8 +492,8 @@ mod tests {
     use std::str::FromStr;
 
     async fn setup_pool() -> Result<SqlitePool> {
-        let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://:memory:")?
-            .foreign_keys(true);
+        let opts =
+            sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -509,18 +547,32 @@ mod tests {
         let msg_id = Uuid::new_v4();
         save_chat_message(&pool, &msg_id, &chat, &alice.id, "hi bob").await?;
 
-        assert!(mark_message_as_read_checked(&pool, &msg_id, &carol.id).await?.is_none());
-        assert!(mark_message_as_read_checked(&pool, &msg_id, &alice.id).await?.is_none());
+        assert!(
+            mark_message_as_read_checked(&pool, &msg_id, &carol.id)
+                .await?
+                .is_none()
+        );
+        assert!(
+            mark_message_as_read_checked(&pool, &msg_id, &alice.id)
+                .await?
+                .is_none()
+        );
 
         let is_read: i64 = sqlx::query_scalar("SELECT is_read FROM messages WHERE id = ?")
-            .bind(msg_id).fetch_one(&pool).await?;
+            .bind(msg_id)
+            .fetch_one(&pool)
+            .await?;
         assert_eq!(is_read, 0);
 
         assert_eq!(
             mark_message_as_read_checked(&pool, &msg_id, &bob.id).await?,
             Some(alice.chat_id)
         );
-        assert!(mark_message_as_read_checked(&pool, &msg_id, &bob.id).await?.is_none());
+        assert!(
+            mark_message_as_read_checked(&pool, &msg_id, &bob.id)
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 }
