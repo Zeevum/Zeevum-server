@@ -14,27 +14,30 @@ impl Hub {
         Self::default()
     }
 
-    pub fn register(&self, chat_id: i64, tx: ClientTx) {
+    pub fn register(&self, user_id: i64, tx: ClientTx) {
         let mut users = self.users.lock().unwrap();
-        users.insert(chat_id, tx);
+        users.insert(user_id, tx);
     }
 
-    pub fn unregister_if(&self, chat_id: i64, tx: &ClientTx) {
+    /// Removes the entry only if it still belongs to this connection, a user
+    /// that reconnected from another device must not be unregistered by the
+    /// cleanup of the old socket
+    pub fn unregister_if(&self, user_id: i64, tx: &ClientTx) {
         let mut users = self.users.lock().unwrap();
-        if let Some(current) = users.get(&chat_id)
+        if let Some(current) = users.get(&user_id)
             && current.same_channel(tx)
         {
-            users.remove(&chat_id);
+            users.remove(&user_id);
         }
     }
 
-    pub fn send_to(&self, target_chat_id: i64, message: &str) -> bool {
+    pub fn send_to(&self, target_user_id: i64, message: &str) -> bool {
         let users = self.users.lock().unwrap();
 
-        if let Some(tx) = users.get(&target_chat_id) {
+        if let Some(tx) = users.get(&target_user_id) {
             tx.send(message.to_string()).is_ok()
         } else {
-            false // Значит что пользователь не в сети
+            false // Means that user is offline
         }
     }
 }

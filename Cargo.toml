@@ -3,8 +3,16 @@ name = "Zeevum-server"
 version = "0.3.0"
 edition = "2024"
 
+[lib]
+name = "zeevum_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "Zeevum-server"
+path = "src/main.rs"
+
 [dependencies]
-Zeevum-protocol = { git = "https://github.com/Zeevum/Zeevum-protocol", tag = "v0.1.0" }
+zeevum-protocol = { git = "https://github.com/Zeevum/zeevum-protocol", branch = "dev" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1.26.0", features = ["v4"] }
 anyhow = "1.0.104"
@@ -21,3 +29,7 @@ rand = "0.10.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 tokio-rustls = "0.26.4"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "macros"] }
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tempfile = "3.27.0"

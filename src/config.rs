@@ -1,6 +1,6 @@
-use crate::{db, logger, trace};
-use Zeevum_protocol::pow::Difficulty;
+use crate::{db, logger};
 use std::{env, path::PathBuf, time::Duration};
+use zeevum_protocol::pow::Difficulty;
 
 #[derive(Debug)]
 pub struct Config {
