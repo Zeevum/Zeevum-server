@@ -394,14 +394,37 @@ pub async fn save_chat_message(
 ) -> Result<()> {
     let now = Utc::now().timestamp();
 
-    sqlx::query("INSERT INTO messages (id, chat_id, sender_id, content, timestamp, is_read) VALUES (?, ?, ?, ?, ?, 0)")
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("failed to begin transaction")?;
+
+    // One counter per conversation, so a seq is never handed out twice.
+    // MAX(seq) + 1 would reuse the number of a deleted message, and a client
+    // that remembered that number would skip the new one.
+    sqlx::query("UPDATE chats SET last_seq = last_seq + 1 WHERE id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let (seq,): (i64,) = sqlx::query_as("SELECT last_seq FROM chats WHERE id = ?")
+        .bind(chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO messages (id, chat_id, sender_id, content, timestamp, is_read, seq) VALUES (?, ?, ?, ?, ?, 0, ?)",
+    )
         .bind(message_id)
         .bind(chat_id)
         .bind(sender_id)
         .bind(content)
         .bind(now)
-        .execute(pool)
+        .bind(seq)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(())
 }
@@ -415,7 +438,7 @@ pub async fn get_chat_history(
     let rows = sqlx::query_as(
         "SELECT m.id, u.user_id, m.content, m.timestamp, m.is_read FROM messages m
             JOIN users u ON u.id = m.sender_id
-            WHERE m.chat_id = ? ORDER BY m.timestamp DESC LIMIT ?",
+            WHERE m.chat_id = ? ORDER BY m.seq DESC LIMIT ?",
     )
     .bind(chat_id)
     .bind(limit)
@@ -742,6 +765,83 @@ mod tests {
         assert!(validate_session(&pool, &token, 720.0).await?.is_none());
         assert!(get_friends_list(&pool, &bob.id).await?.is_empty());
         assert!(get_user_by_login(&pool, "Alice").await?.is_none());
+        Ok(())
+    }
+
+    /// Three messages inside one second. Ordering by timestamp cannot tell
+    /// them apart, so which two survived the limit was left to the database.
+    #[tokio::test]
+    async fn the_newest_messages_survive_the_history_limit() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        for text in ["first", "second", "third"] {
+            save_chat_message(&pool, &Uuid::new_v4(), &chat, &alice.id, text).await?;
+        }
+
+        sqlx::query("UPDATE messages SET timestamp = 1700000000 WHERE chat_id = ?")
+            .bind(chat)
+            .execute(&pool)
+            .await?;
+
+        let history = get_chat_history(&pool, &chat, 2).await?;
+        let contents: Vec<&str> = history.iter().map(|row| row.2.as_str()).collect();
+        assert_eq!(contents, vec!["third", "second"]);
+
+        Ok(())
+    }
+
+    /// A client walks the history by seq, so a number that comes back would
+    /// make it skip a message it has never seen.
+    #[tokio::test]
+    async fn a_deleted_message_does_not_give_its_seq_away() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        save_chat_message(&pool, &Uuid::new_v4(), &chat, &alice.id, "one").await?;
+        let second = Uuid::new_v4();
+        save_chat_message(&pool, &second, &chat, &alice.id, "two").await?;
+
+        sqlx::query("DELETE FROM messages WHERE id = ?")
+            .bind(second)
+            .execute(&pool)
+            .await?;
+
+        let third = Uuid::new_v4();
+        save_chat_message(&pool, &third, &chat, &alice.id, "three").await?;
+
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(third)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(seq, 3);
+
+        Ok(())
+    }
+
+    /// The counter belongs to the conversation, so two chats do not share it.
+    #[tokio::test]
+    async fn seq_counts_within_each_conversation() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let carol = add_user(&pool, "Carol", "third_password_789_C!").await?;
+
+        let with_bob = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+        let with_carol = get_or_create_private_chat(&pool, &alice.id, &carol.id).await?;
+
+        save_chat_message(&pool, &Uuid::new_v4(), &with_bob, &alice.id, "hi bob").await?;
+        save_chat_message(&pool, &Uuid::new_v4(), &with_carol, &alice.id, "hi carol").await?;
+
+        let seqs: Vec<i64> = sqlx::query_scalar("SELECT seq FROM messages ORDER BY seq, id")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(seqs, vec![1, 1]);
+
         Ok(())
     }
 
