@@ -13,11 +13,11 @@ dependencies = [
  "ctrlc",
  "dotenvy",
  "password-hash 0.6.1",
- "rand",
  "rand_core 0.10.1",
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "zeevum-protocol"
 version = "0.1.1"
-source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#6dc01461984e28f4c1bedc05cfade808745fd5a9"
+source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#592864c867cd96cf8cae2c6f3cc5d276b3cde671"
 dependencies = [
  "rand",
  "serde",

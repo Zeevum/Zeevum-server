@@ -1,5 +1,3 @@
-//! TLS server configuration built from PEM files on disk
-
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -9,7 +7,6 @@ use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
-/// Builds a TLS server config from a certificate chain and a private key
 pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
     let cert_file = &mut BufReader::new(
         File::open(cert_path).with_context(|| format!("Failed to open cert file {cert_path:?}"))?,

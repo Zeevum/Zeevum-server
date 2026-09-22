@@ -1,15 +1,10 @@
-//! Wire-level framing. One JSON document per line
-
 use tokio::io::AsyncBufReadExt;
 use zeevum_protocol::{MAX_LINE_BYTES, ServerMsg, encode};
 
-/// Serializes a server message into a wire frame, JSON plus a trailing newline
 pub fn frame(msg: &ServerMsg) -> String {
     encode(msg).expect("ServerMsg serialization cannot fail")
 }
 
-/// Reads a single newline terminated frame
-///
 /// Frames longer than [`MAX_LINE_BYTES`] are rejected with
 /// [`std::io::ErrorKind::InvalidData`], which closes the connection
 pub async fn read_frame<S>(reader: &mut S) -> std::io::Result<String>

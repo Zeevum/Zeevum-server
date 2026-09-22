@@ -1,10 +1,5 @@
 #![allow(dead_code)]
 
-//! Shared harness for integration tests
-//!
-//! Every test starts a real server. Ephemeral port, temporary database and a
-//! self-signed certificate generated on the fly
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -31,19 +26,22 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 static INIT: Once = Once::new();
 
-/// A running server plus the trust anchor a client needs to reach it
 pub struct TestServer {
     pub addr: SocketAddr,
+    /// Tests that count rows need it, a behaviour can be wrong in the database
+    /// and still look right on the wire.
+    pub pool: sqlx::SqlitePool,
     roots: RootCertStore,
-    /// Kept alive so the temporary directory outlives the test
+    /// Kept alive so the temporary directory outlives the test.
     _dir: TempDir,
 }
 
 impl TestServer {
     pub async fn start() -> Self {
         INIT.call_once(|| {
+            // The binary does this in `main`, a test binary has to do it itself.
             let _ = rustls::crypto::ring::default_provider().install_default();
-            // Without init the logger falls back to stderr at every level
+            // Without init the logger falls back to stderr at every level.
             zeevum_server::logger::init("Zeevum-server-test", LogLevel::Error);
         });
 
@@ -71,6 +69,7 @@ impl TestServer {
             handshake_timeout: Duration::from_secs(10),
             tls_cert_path: cert_path,
             tls_key_path: key_path,
+            // Weak keeps PoW solving negligible inside tests.
             pow_difficulty: Difficulty::Weak,
             session_duration_hours: 24.0,
             log_level: LogLevel::Error,
@@ -79,6 +78,7 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let ctx = AppContext::new(config).await.expect("build context");
+        let pool = ctx.pool.clone();
 
         tokio::spawn(async move {
             if let Err(e) = serve(ctx, listener).await {
@@ -89,12 +89,12 @@ impl TestServer {
         Self {
             addr,
             roots,
+            pool,
             _dir: dir,
         }
     }
 }
 
-/// A minimal TLS client speaking the Zeevum line protocol
 pub struct TestClient {
     rx: BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>,
     tx: tokio::io::WriteHalf<TlsStream<TcpStream>>,
@@ -127,19 +127,21 @@ impl TestClient {
         self.tx.flush().await.expect("flush");
     }
 
-    /// Reads one frame. `None` means the server closed the connection
+    /// `None` means the server closed the connection.
     pub async fn recv(&mut self) -> Option<ServerMsg> {
         let mut line = String::new();
         match timeout(TIMEOUT, self.rx.read_line(&mut line)).await {
             Ok(Ok(0)) => None,
             Ok(Ok(_)) => Some(decode(line.trim()).expect("decode frame")),
+            // The server currently drops the TLS stream without sending
+            // close_notify, so rustls reports that as an error rather than EOF.
+            // Either way the connection is gone, see step 5.5.
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
             Ok(Err(e)) => panic!("read error: {e}"),
             Err(_) => panic!("timed out waiting for a frame"),
         }
     }
 
-    /// Reads frames until `f` matches, discarding everything before it
     pub async fn recv_until<F>(&mut self, f: F) -> ServerMsg
     where
         F: Fn(&ServerMsg) -> bool,
@@ -153,21 +155,19 @@ impl TestClient {
         }
     }
 
-    /// Writes raw bytes, bypassing encoding. Used to test the framing layer
+    /// Writes raw bytes, bypassing encoding. Used to test the framing layer.
     pub async fn send_raw(&mut self, bytes: &[u8]) {
         self.tx.write_all(bytes).await.expect("write raw");
         self.tx.flush().await.expect("flush raw");
     }
 }
 
-/// What a successful authentication gives back
 #[derive(Debug)]
 pub struct Session {
     pub user_id: i64,
     pub token: String,
 }
 
-/// Runs the handshake, solving the proof of work if the server asks for it
 pub async fn authenticate(client: &mut TestClient, method: AuthMethod) -> Result<Session, String> {
     client
         .send(&ClientMsg::Auth {
@@ -222,17 +222,15 @@ pub async fn login(
     .await
 }
 
-/// Makes two connected, authenticated users friends
-///
-/// `from` sends the request and `to` accepts it, the way the client flow does
-/// The acknowledgement frames are consumed so that a caller which starts
-/// reading right afterwards is not surprised by them
+/// The acknowledgement frames are consumed, so a caller that starts reading
+/// right afterwards is not surprised by them.
 pub async fn befriend(from: &mut TestClient, to: &mut TestClient, from_id: i64, to_id: i64) {
     from.send(&ClientMsg::FriendReq {
         target_user_id: to_id,
     })
     .await;
 
+    // The other side hears about the request...
     match to
         .recv_until(|m| matches!(m, ServerMsg::IncomingReq { .. }))
         .await
@@ -241,6 +239,7 @@ pub async fn befriend(from: &mut TestClient, to: &mut TestClient, from_id: i64, 
         other => panic!("expected IncomingReq, got {other:?}"),
     }
 
+    // ...and names the requester when accepting.
     to.send(&ClientMsg::AcceptFriend {
         target_user_id: from_id,
     })
@@ -252,8 +251,6 @@ pub async fn befriend(from: &mut TestClient, to: &mut TestClient, from_id: i64, 
         .await;
 }
 
-/// Opens (creating it on first use) the direct conversation with a user and
-/// returns its id. This is the step the client performs once and then caches
 pub async fn resolve_dm(client: &mut TestClient, peer_user_id: i64) -> Result<Uuid, ErrorCode> {
     client.send(&ClientMsg::ResolveDm { peer_user_id }).await;
 

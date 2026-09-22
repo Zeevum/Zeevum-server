@@ -4,6 +4,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use chrono::{DateTime, Local, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
@@ -69,11 +70,9 @@ pub fn get_db_path() -> Result<PathBuf> {
     Ok(db_dir.join("database.sqlite"))
 }
 
-/// Allocates the next public user id
-///
 /// Runs inside the caller's transaction. Reading a counter instead of probing
 /// for a free value removes both the collision window and the unbounded retry
-/// loop the old random ids needed
+/// loop the old random ids needed.
 async fn allocate_user_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<i64> {
     sqlx::query("UPDATE user_id_seq SET last = last + 1")
         .execute(&mut **tx)
@@ -101,10 +100,14 @@ pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Res
     let id = Uuid::new_v4();
     let hashed_password = hash_password(raw_password).context("hashing password")?;
     let now = Utc::now().timestamp();
+
+    // One transaction for "take an id, insert the row", so two concurrent
+    // registrations can no longer race for the same value.
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin registration transaction")?;
+
     let user_id = allocate_user_id(&mut tx).await?;
 
     sqlx::query(
@@ -145,6 +148,13 @@ pub async fn get_user_by_login(pool: &SqlitePool, login: &str) -> Result<Option<
     }
 }
 
+/// The token itself is never stored, a database gets read as a whole, a backup,
+/// a misplaced disk, a stray `SELECT *`. Constant-time comparison is absent on
+/// purpose, lookups go by the hash, so nothing secret is being compared.
+fn token_hash(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
 pub async fn create_session(
     pool: &SqlitePool,
     user_id: Uuid,
@@ -154,8 +164,8 @@ pub async fn create_session(
     let now = Utc::now().timestamp();
     let expires_at = now + (duration_hours * 3600.0) as i64;
 
-    sqlx::query("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)")
-        .bind(&token)
+    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
+        .bind(token_hash(&token))
         .bind(user_id)
         .bind(expires_at)
         .execute(pool)
@@ -168,12 +178,13 @@ pub async fn validate_session(
     pool: &SqlitePool,
     token: &str,
     duration_hours: f64,
-) -> Result<Option<User>> {
+) -> Result<Option<(User, i64)>> {
     let now = Utc::now().timestamp();
 
+    let hash = token_hash(token);
     let session_row =
-        sqlx::query("SELECT user_id FROM sessions WHERE token = ? AND expires_at > ?")
-            .bind(token)
+        sqlx::query("SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?")
+            .bind(&hash)
             .bind(now)
             .fetch_optional(pool)
             .await?;
@@ -182,9 +193,9 @@ pub async fn validate_session(
         let user_id: Uuid = session_row.try_get("user_id")?;
         let new_expires_at = now + (duration_hours * 3600.0) as i64;
 
-        sqlx::query("UPDATE sessions SET expires_at = ? WHERE token = ?")
+        sqlx::query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
             .bind(new_expires_at)
-            .bind(token)
+            .bind(&hash)
             .execute(pool)
             .await?;
 
@@ -194,9 +205,40 @@ pub async fn validate_session(
                 .fetch_one(pool)
                 .await?;
 
-        return Ok(Some(map_row_to_user(&user_row)?));
+        return Ok(Some((map_row_to_user(&user_row)?, new_expires_at)));
     }
     Ok(None)
+}
+
+/// Nothing ever removed expired sessions, so the table grew forever, one row
+/// per client start and one per dropped connection.
+/// Revoking here is what stops the token being used again, the caller only
+/// closes the socket.
+pub async fn revoke_session(pool: &SqlitePool, token: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+        .bind(token_hash(token))
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Also what a password change will want, an attacker who already has a token
+/// must not keep it just because the password is no longer the weak part.
+pub async fn revoke_all_sessions(pool: &SqlitePool, user_id: Uuid) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn delete_expired_sessions(pool: &SqlitePool) -> Result<u64> {
+    let now = Utc::now().timestamp();
+    let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn get_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<User>> {
@@ -272,16 +314,14 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
         .is_ok()
 }
 
-/// Sorts a pair of users into a canonical order, so that "Alice and John" and
-/// "John and Alice" resolve to the same conversation
+/// Sorts a pair of users into a canonical order, so that "Alice and Bob" and
+/// "Bob and Alice" resolve to the same conversation.
 fn ordered_pair(a: &Uuid, b: &Uuid) -> (Uuid, Uuid) {
     if a <= b { (*a, *b) } else { (*b, *a) }
 }
 
-/// Returns the direct conversation between two users, creating it on first use
-///
 /// Uniqueness comes from `private_chats`, not from the hope that two requests
-/// will not arrive at the same moment
+/// will not arrive at the same moment.
 pub async fn get_or_create_private_chat(
     pool: &SqlitePool,
     user1_id: &Uuid,
@@ -318,6 +358,8 @@ pub async fn get_or_create_private_chat(
         .execute(&mut *tx)
         .await?;
 
+    // Both memberships and the pair row go in together, a chat that exists but
+    // is not listed in private_chats would be orphaned on the next lookup.
     sqlx::query("INSERT INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)")
         .bind(chat_id)
         .bind(user_a)
@@ -364,10 +406,7 @@ pub async fn save_chat_message(
     Ok(())
 }
 
-/// Recent messages of a conversation, newest first
-///
-/// The caller is expected to reverse this before showing it, the limit selects
-/// the *latest* messages, but a chat reads top to bottom
+/// Newest first, the caller is expected to reverse this before showing it.
 pub async fn get_chat_history(
     pool: &SqlitePool,
     chat_id: &Uuid,
@@ -386,9 +425,9 @@ pub async fn get_chat_history(
     Ok(rows)
 }
 
-/// Помечает сообщение прочитанным, только если reader - участник чата этого
-/// сообщения и не его автор. Возвращает public id отправителя, если уведомить
-/// нужно (только что прочитано впервые), иначе None
+/// Marks a message read, but only if the reader belongs to its conversation
+/// and is not its author. Returns the public id of the sender when a
+/// notification is due, on the first read only, otherwise `None`.
 pub async fn mark_message_as_read_checked(
     pool: &SqlitePool,
     message_id: &Uuid,
@@ -399,6 +438,8 @@ pub async fn mark_message_as_read_checked(
         .await
         .context("failed to begin transaction")?;
 
+    // Membership is checked here, not by the caller, the reader must belong to
+    // the conversation the message is in, and must not be its author.
     let row: Option<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT m.chat_id, m.sender_id FROM messages m
          JOIN chat_members cm ON cm.chat_id = m.chat_id AND cm.user_id = ?
@@ -423,6 +464,8 @@ pub async fn mark_message_as_read_checked(
         return Ok(None);
     }
 
+    // Protocol v2 addresses everything by conversation, so the sender is not
+    // enough, the client needs to know which conversation to mark.
     let (sender_user_id,): (i64,) = sqlx::query_as("SELECT user_id FROM users WHERE id = ?")
         .bind(sender_id)
         .fetch_one(&mut *tx)
@@ -447,12 +490,9 @@ pub async fn get_user_by_user_id(pool: &SqlitePool, user_id: i64) -> Result<Opti
     }
 }
 
-/// Accepts the request that `requester` previously sent to `acceptor`
-///
-/// Returns `false` when there was nothing to accept. This is the fix for the
-/// hole where anyone could accept a friendship nobody offered, the `UPDATE`
-/// silently affected zero rows, and the insert that followed then created an
-/// accepted friendship out of nothing
+/// Returns `false` when there was nothing to accept. The `UPDATE` silently
+/// affected zero rows, and the insert that followed created an accepted
+/// friendship out of nothing.
 pub async fn accept_friend_request(
     pool: &SqlitePool,
     acceptor: &Uuid,
@@ -463,6 +503,9 @@ pub async fn accept_friend_request(
         .await
         .context("begin accept friend request")?;
 
+    // Strictly the direction "they asked me". Accepting a request you sent
+    // yourself must not work, and neither must accepting one that was never
+    // sent at all.
     let pending: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ? AND status = 'pending')",
     )
@@ -481,6 +524,9 @@ pub async fn accept_friend_request(
         .execute(&mut *tx)
         .await?;
 
+    // The acceptor may have sent a request of their own on the way here, it is
+    // moot now. Left in place it would keep showing up as an incoming request
+    // from somebody who is already in the friend list.
     sqlx::query("DELETE FROM friends WHERE user_id = ? AND friend_id = ? AND status = 'pending'")
         .bind(acceptor)
         .bind(requester)
@@ -543,15 +589,8 @@ pub async fn get_pending_requests(pool: &SqlitePool, user_id: &Uuid) -> Result<V
     Ok(reqs)
 }
 
-/// Whether two users have an accepted friendship
-///
-/// A pending request does not count, and neither direction is privileged, the
-/// check looks at both rows because that is how `accept_friend_request` leaves
-/// them
-/// Whether two users have an accepted friendship
-///
-/// A pending request does not count, and neither direction is privileged, both
-/// rows are looked at, because that is how `accept_friend_request` leaves them
+/// A pending request does not count, and neither direction is privileged.
+/// A pending request does not count, and neither direction is privileged.
 pub async fn are_friends(pool: &SqlitePool, a: &Uuid, b: &Uuid) -> Result<bool> {
     let accepted: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM friends WHERE status = 'accepted' AND user_id = ? AND friend_id = ?) \
@@ -567,29 +606,23 @@ pub async fn are_friends(pool: &SqlitePool, a: &Uuid, b: &Uuid) -> Result<bool> 
     Ok(accepted)
 }
 
-/// What came of a friend request
+/// What came of a friend request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FriendReqOutcome {
-    /// A new pending request was stored
+    /// A new pending request was stored.
     Sent,
-    /// The same request was already waiting, so the other side was not told again
+    /// The same request was already waiting, so the other side was not told again.
     AlreadyPending,
-    /// The two are already friends
+    /// The two are already friends.
     AlreadyFriends,
 }
 
-/// Files a friend request from `from` to `to`
-///
-/// Requests are directional: only the recipient can accept one. An existing
-/// request is not announced a second time, because otherwise the command is a
-/// ready-made notification pump - a thousand frames would mean a thousand
-/// notifications for the target
-/// Whether a user is a participant of a conversation
-///
-/// This is the authorization check for everything addressed by `conv_id`. For
-/// a direct conversation it happens to coincide with being friends, but the
-/// question is asked of the conversation, not of the pair - which is what lets
-/// group chats reuse it unchanged
+/// Requests are directional, only the recipient can accept one. An existing
+/// request is not announced a second time, otherwise the command is a
+/// ready-made notification pump.
+/// The authorization check for everything addressed by `conv_id`. The question
+/// is asked of the conversation, not of the pair, which is what lets group
+/// chats reuse it unchanged.
 pub async fn is_member(pool: &SqlitePool, conv_id: &Uuid, user_id: &Uuid) -> Result<bool> {
     let member: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?)",
@@ -602,10 +635,7 @@ pub async fn is_member(pool: &SqlitePool, conv_id: &Uuid, user_id: &Uuid) -> Res
     Ok(member)
 }
 
-/// The public ids of everyone in a conversation
-///
-/// Used to deliver a message without assuming there are exactly two
-/// participants
+/// Used to deliver a message without assuming there are exactly two participants.
 pub async fn member_user_ids(pool: &SqlitePool, conv_id: &Uuid) -> Result<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT u.user_id FROM chat_members cm
@@ -687,12 +717,12 @@ mod tests {
         let pool = setup_pool().await?;
 
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
         assert!(get_user_by_login(&pool, "alice").await?.is_some());
 
-        let c1 = get_or_create_private_chat(&pool, &alice.id, &john.id).await?;
-        let c2 = get_or_create_private_chat(&pool, &john.id, &alice.id).await?;
+        let c1 = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+        let c2 = get_or_create_private_chat(&pool, &bob.id, &alice.id).await?;
         assert_eq!(c1, c2);
 
         let msg_id = Uuid::new_v4();
@@ -703,15 +733,150 @@ mod tests {
         let (token, _) = create_session(&pool, alice.id, 720.0).await?;
         assert!(validate_session(&pool, &token, 720.0).await?.is_some());
 
-        add_friend_request(&pool, &john.id, &alice.id).await?;
-        accept_friend_request(&pool, &alice.id, &john.id).await?;
+        add_friend_request(&pool, &bob.id, &alice.id).await?;
+        accept_friend_request(&pool, &alice.id, &bob.id).await?;
         assert_eq!(get_friends_list(&pool, &alice.id).await?.len(), 1);
         assert_eq!(get_pending_requests(&pool, &alice.id).await?.len(), 0);
 
         assert!(delete_user(&pool, &alice.id).await?);
         assert!(validate_session(&pool, &token, 720.0).await?.is_none());
-        assert!(get_friends_list(&pool, &john.id).await?.is_empty());
+        assert!(get_friends_list(&pool, &bob.id).await?.is_empty());
         assert!(get_user_by_login(&pool, "Alice").await?.is_none());
+        Ok(())
+    }
+
+    async fn session_count(pool: &SqlitePool) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM sessions")
+            .fetch_one(pool)
+            .await?;
+        Ok(row.try_get("n")?)
+    }
+
+    /// Fails if we start writing the token itself again instead of its hash.
+    #[tokio::test]
+    async fn session_token_is_never_stored_in_plaintext() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+
+        let (token, _) = create_session(&pool, alice.id, 720.0).await?;
+
+        // The row must not be findable by the raw token.
+        let by_token: Option<(String,)> =
+            sqlx::query_as("SELECT token_hash FROM sessions WHERE token_hash = ?")
+                .bind(&token)
+                .fetch_optional(&pool)
+                .await?;
+        assert!(
+            by_token.is_none(),
+            "raw token is stored in the database: {token}"
+        );
+
+        // It must be findable by the hash, and validation must still work.
+        let by_hash: Option<(String,)> =
+            sqlx::query_as("SELECT token_hash FROM sessions WHERE token_hash = ?")
+                .bind(token_hash(&token))
+                .fetch_optional(&pool)
+                .await?;
+        assert!(by_hash.is_some(), "session is not findable by token hash");
+        assert!(validate_session(&pool, &token, 720.0).await?.is_some());
+
+        Ok(())
+    }
+
+    /// Arriving with a token must not add a row. `validate_session` renews
+    /// the one already there, and every extra row used to be permanent.
+    #[tokio::test]
+    async fn token_login_does_not_create_another_session_row() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+
+        let (token, _) = create_session(&pool, alice.id, 720.0).await?;
+        let after_login = session_count(&pool).await?;
+
+        for _ in 0..5 {
+            assert!(validate_session(&pool, &token, 720.0).await?.is_some());
+        }
+
+        assert_eq!(
+            session_count(&pool).await?,
+            after_login,
+            "token login added session rows"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoked_token_stops_working() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+
+        let (token, _) = create_session(&pool, alice.id, 720.0).await?;
+        assert!(validate_session(&pool, &token, 720.0).await?.is_some());
+
+        assert_eq!(revoke_session(&pool, &token).await?, 1);
+        assert!(validate_session(&pool, &token, 720.0).await?.is_none());
+        Ok(())
+    }
+
+    /// "Log out everywhere" has to take the other device down with it, not
+    /// only the one that asked.
+    #[tokio::test]
+    async fn revoking_all_sessions_kills_the_other_device() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+
+        let (phone, _) = create_session(&pool, alice.id, 720.0).await?;
+        let (laptop, _) = create_session(&pool, alice.id, 720.0).await?;
+
+        assert_eq!(revoke_all_sessions(&pool, alice.id).await?, 2);
+        assert!(validate_session(&pool, &phone, 720.0).await?.is_none());
+        assert!(validate_session(&pool, &laptop, 720.0).await?.is_none());
+        Ok(())
+    }
+
+    /// A session of another user is not ours to revoke.
+    #[tokio::test]
+    async fn revoking_all_sessions_leaves_other_users_alone() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "another_password_456_B!").await?;
+
+        let (alice_token, _) = create_session(&pool, alice.id, 720.0).await?;
+        let (bob_token, _) = create_session(&pool, bob.id, 720.0).await?;
+
+        assert_eq!(revoke_all_sessions(&pool, alice.id).await?, 1);
+        assert!(
+            validate_session(&pool, &alice_token, 720.0)
+                .await?
+                .is_none()
+        );
+        assert!(validate_session(&pool, &bob_token, 720.0).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_are_deleted_and_live_ones_are_kept() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+
+        let (token, _) = create_session(&pool, alice.id, 720.0).await?;
+        assert_eq!(
+            delete_expired_sessions(&pool).await?,
+            0,
+            "a live session was deleted"
+        );
+
+        // Push the expiry into the past, the row must go. Note it is the
+        // timestamp that has to move behind "now", not just below the old
+        // expiry, that one is still a month away.
+        sqlx::query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+            .bind(Utc::now().timestamp() - 1)
+            .bind(token_hash(&token))
+            .execute(&pool)
+            .await?;
+
+        assert_eq!(delete_expired_sessions(&pool).await?, 1);
+        assert!(validate_session(&pool, &token, 720.0).await?.is_none());
         Ok(())
     }
 
@@ -720,12 +885,12 @@ mod tests {
         let pool = setup_pool().await?;
 
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
-        let carol = add_user(&pool, "Carol", "carol_password_123_A!").await?;
-        let chat = get_or_create_private_chat(&pool, &alice.id, &john.id).await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let carol = add_user(&pool, "Carol", "carol_password_789_C!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
 
         let msg_id = Uuid::new_v4();
-        save_chat_message(&pool, &msg_id, &chat, &alice.id, "hi john").await?;
+        save_chat_message(&pool, &msg_id, &chat, &alice.id, "hi bob").await?;
 
         assert!(
             mark_message_as_read_checked(&pool, &msg_id, &carol.id)
@@ -744,12 +909,14 @@ mod tests {
             .await?;
         assert_eq!(is_read, 0);
 
+        // The reader is told both who to notify and which conversation the
+        // message belongs to.
         assert_eq!(
-            mark_message_as_read_checked(&pool, &msg_id, &john.id).await?,
+            mark_message_as_read_checked(&pool, &msg_id, &bob.id).await?,
             Some((chat, alice.user_id))
         );
         assert!(
-            mark_message_as_read_checked(&pool, &msg_id, &john.id)
+            mark_message_as_read_checked(&pool, &msg_id, &bob.id)
                 .await?
                 .is_none()
         );
@@ -757,7 +924,7 @@ mod tests {
     }
 
     /// The upgrade path, a database built by 0001 that already holds accounts
-    /// must keep every existing number once 0002 has run
+    /// must keep every existing number once 0002 has run.
     #[tokio::test]
     async fn migration_0002_preserves_existing_ids_and_chats() -> Result<()> {
         let opts = SqliteConnectOptions::from_str("sqlite://:memory:")?.foreign_keys(true);
@@ -771,11 +938,11 @@ mod tests {
             .await?;
 
         let alice_id = Uuid::new_v4();
-        let john_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
 
         for (id, login, number) in [
             (alice_id, "alice", 4_242_424_i64),
-            (john_id, "john", 9_999_999_i64),
+            (bob_id, "bob", 9_999_999_i64),
         ] {
             sqlx::query(
                 "INSERT INTO users (id, chat_id, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -789,12 +956,14 @@ mod tests {
                 .await?;
         }
 
+        // A conversation built the 0001 way, a chat row plus two memberships,
+        // and nothing anywhere that says "these two belong together".
         let old_chat = Uuid::new_v4();
         sqlx::query("INSERT INTO chats (id, type, created_at) VALUES (?, 'private', 0)")
             .bind(old_chat)
             .execute(&pool)
             .await?;
-        for member in [alice_id, john_id] {
+        for member in [alice_id, bob_id] {
             sqlx::query("INSERT INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, 0)")
                 .bind(old_chat)
                 .bind(member)
@@ -802,32 +971,38 @@ mod tests {
                 .await?;
         }
 
+        // sqlx runs every migration inside a transaction, so 0002 must work there too.
         let mut tx = pool.begin().await?;
         sqlx::raw_sql(include_str!("../migrations/0002_identity_model.sql"))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
 
+        // Renamed, not renumbered, these numbers are already stored in other
+        // people's friend lists.
         let (alice_number,): (i64,) =
             sqlx::query_as("SELECT user_id FROM users WHERE login = 'alice'")
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(alice_number, 4_242_424);
 
+        // The counter continues above the highest number already in use.
         let (seq,): (i64,) = sqlx::query_as("SELECT last FROM user_id_seq")
             .fetch_one(&pool)
             .await?;
         assert_eq!(seq, 9_999_999);
 
-        let carol = add_user(&pool, "Carol", "carol_password_123_A!").await?;
+        let carol = add_user(&pool, "Carol", "carol_password_789_C!").await?;
         assert_eq!(carol.user_id, 10_000_000);
 
+        // The existing conversation is adopted, in either order. Without the
+        // backfill this would open a second, empty copy of the same dialogue.
         assert_eq!(
-            get_or_create_private_chat(&pool, &alice_id, &john_id).await?,
+            get_or_create_private_chat(&pool, &alice_id, &bob_id).await?,
             old_chat
         );
         assert_eq!(
-            get_or_create_private_chat(&pool, &john_id, &alice_id).await?,
+            get_or_create_private_chat(&pool, &bob_id, &alice_id).await?,
             old_chat
         );
 
@@ -840,40 +1015,40 @@ mod tests {
     }
 
     /// A pending request is not a friendship, and acceptance works from either
-    /// side of the pair
+    /// side of the pair.
     #[tokio::test]
     async fn friendship_is_only_accepted_and_is_symmetric() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        assert!(!are_friends(&pool, &alice.id, &john.id).await?);
+        assert!(!are_friends(&pool, &alice.id, &bob.id).await?);
 
-        // Alice asks, John has not answered yet
-        add_friend_request(&pool, &alice.id, &john.id).await?;
-        assert!(!are_friends(&pool, &alice.id, &john.id).await?);
-        assert!(!are_friends(&pool, &john.id, &alice.id).await?);
+        // Alice asks, Bob has not answered yet.
+        add_friend_request(&pool, &alice.id, &bob.id).await?;
+        assert!(!are_friends(&pool, &alice.id, &bob.id).await?);
+        assert!(!are_friends(&pool, &bob.id, &alice.id).await?);
 
-        // John accepts. Alice is the requester, John the acceptor
-        assert!(accept_friend_request(&pool, &john.id, &alice.id).await?);
-        assert!(are_friends(&pool, &alice.id, &john.id).await?);
-        assert!(are_friends(&pool, &john.id, &alice.id).await?);
+        // Bob accepts. Alice is the requester, Bob the acceptor.
+        assert!(accept_friend_request(&pool, &bob.id, &alice.id).await?);
+        assert!(are_friends(&pool, &alice.id, &bob.id).await?);
+        assert!(are_friends(&pool, &bob.id, &alice.id).await?);
 
         Ok(())
     }
 
-    /// Nobody can accept a friendship that was never offered
+    /// Nobody can accept a friendship that was never offered.
     ///
     /// The old code updated zero rows and then inserted an accepted friendship
-    /// anyway, so this returned success and created a friendship from nothing
+    /// anyway, so this returned success and created a friendship from nothing.
     #[tokio::test]
     async fn accept_without_a_request_changes_nothing() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        assert!(!accept_friend_request(&pool, &john.id, &alice.id).await?);
-        assert!(!are_friends(&pool, &alice.id, &john.id).await?);
+        assert!(!accept_friend_request(&pool, &bob.id, &alice.id).await?);
+        assert!(!are_friends(&pool, &alice.id, &bob.id).await?);
 
         let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM friends")
             .fetch_one(&pool)
@@ -883,50 +1058,55 @@ mod tests {
         Ok(())
     }
 
-    /// Accepting a request you sent yourself must not work, the other side has not agreed to anything
+    /// Accepting a request you sent yourself must not work, the other side has
+    /// not agreed to anything.
     #[tokio::test]
     async fn accepting_your_own_request_does_not_work() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        // John asks Alice
+        // Bob asks Alice.
         assert_eq!(
-            add_friend_request(&pool, &john.id, &alice.id).await?,
+            add_friend_request(&pool, &bob.id, &alice.id).await?,
             FriendReqOutcome::Sent
         );
 
-        // John cannot accept his own request
-        assert!(!accept_friend_request(&pool, &john.id, &alice.id).await?);
-        assert!(!are_friends(&pool, &alice.id, &john.id).await?);
+        // Bob cannot accept his own request.
+        assert!(!accept_friend_request(&pool, &bob.id, &alice.id).await?);
+        assert!(!are_friends(&pool, &alice.id, &bob.id).await?);
 
-        // Alice can, and then it sticks
-        assert!(accept_friend_request(&pool, &alice.id, &john.id).await?);
-        assert!(are_friends(&pool, &alice.id, &john.id).await?);
+        // Alice can, and then it sticks.
+        assert!(accept_friend_request(&pool, &alice.id, &bob.id).await?);
+        assert!(are_friends(&pool, &alice.id, &bob.id).await?);
 
         Ok(())
     }
 
-    /// Accepting must not leave the acceptors own request hanging, otherwise
-    /// the same person shows up both as a friend and as an incoming request
+    /// Accepting must not leave the acceptor's own request hanging, otherwise
+    /// the same person shows up both as a friend and as an incoming request.
     #[tokio::test]
     async fn accepting_clears_the_acceptors_own_moot_request() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
+        // Both ask each other.
         assert_eq!(
-            add_friend_request(&pool, &alice.id, &john.id).await?,
+            add_friend_request(&pool, &alice.id, &bob.id).await?,
             FriendReqOutcome::Sent
         );
         assert_eq!(
-            add_friend_request(&pool, &john.id, &alice.id).await?,
+            add_friend_request(&pool, &bob.id, &alice.id).await?,
             FriendReqOutcome::Sent
         );
 
-        assert!(accept_friend_request(&pool, &john.id, &alice.id).await?);
-        assert!(are_friends(&pool, &alice.id, &john.id).await?);
+        // Bob accepts the request Alice sent.
+        assert!(accept_friend_request(&pool, &bob.id, &alice.id).await?);
+        assert!(are_friends(&pool, &alice.id, &bob.id).await?);
 
+        // Alice must not see a pending request from someone already in her
+        // friend list.
         let pending = get_pending_requests(&pool, &alice.id).await?;
         assert!(
             pending.is_empty(),
@@ -939,33 +1119,33 @@ mod tests {
         Ok(())
     }
 
-    /// The three outcomes, so the handler can avoid reannouncing a request
-    /// that is already sitting on the other side's screen
+    /// The three outcomes, so the handler can avoid re-announcing a request
+    /// that is already sitting on the other side's screen.
     #[tokio::test]
     async fn friend_request_reports_its_outcome() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
         assert_eq!(
-            add_friend_request(&pool, &alice.id, &john.id).await?,
+            add_friend_request(&pool, &alice.id, &bob.id).await?,
             FriendReqOutcome::Sent
         );
         assert_eq!(
-            add_friend_request(&pool, &alice.id, &john.id).await?,
+            add_friend_request(&pool, &alice.id, &bob.id).await?,
             FriendReqOutcome::AlreadyPending
         );
 
-        // The reverse direction is a separate request, not a duplicate
+        // The reverse direction is a separate request, not a duplicate.
         assert_eq!(
-            add_friend_request(&pool, &john.id, &alice.id).await?,
+            add_friend_request(&pool, &bob.id, &alice.id).await?,
             FriendReqOutcome::Sent
         );
 
-        assert!(accept_friend_request(&pool, &john.id, &alice.id).await?);
+        assert!(accept_friend_request(&pool, &bob.id, &alice.id).await?);
 
         assert_eq!(
-            add_friend_request(&pool, &alice.id, &john.id).await?,
+            add_friend_request(&pool, &alice.id, &bob.id).await?,
             FriendReqOutcome::AlreadyFriends
         );
 
@@ -973,15 +1153,15 @@ mod tests {
     }
 
     /// The pair is stored in a canonical order, so asking for a conversation in
-    /// either direction must not produce two of them
+    /// either direction must not produce two of them.
     #[tokio::test]
     async fn private_chat_is_one_per_pair() -> Result<()> {
         let pool = setup_pool().await?;
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        let forward = get_or_create_private_chat(&pool, &alice.id, &john.id).await?;
-        let backward = get_or_create_private_chat(&pool, &john.id, &alice.id).await?;
+        let forward = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+        let backward = get_or_create_private_chat(&pool, &bob.id, &alice.id).await?;
         assert_eq!(forward, backward);
 
         let (chats,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chats")
@@ -999,19 +1179,19 @@ mod tests {
     }
 
     /// A number must never come back, not even after the account that held the
-    /// highest one is deleted
+    /// highest one is deleted.
     #[tokio::test]
     async fn deleted_user_id_is_never_reused() -> Result<()> {
         let pool = setup_pool().await?;
 
         let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
-        let john = add_user(&pool, "John", "other_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        let highest = john.user_id;
-        assert!(delete_user(&pool, &john.id).await?);
+        let highest = bob.user_id;
+        assert!(delete_user(&pool, &bob.id).await?);
         assert!(delete_user(&pool, &alice.id).await?);
 
-        let carol = add_user(&pool, "Carol", "carol_password_123_A!").await?;
+        let carol = add_user(&pool, "Carol", "carol_password_789_C!").await?;
         assert_eq!(carol.user_id, highest + 1);
 
         // Looking up the dead number finds nobody, it does not resurrect Alice.

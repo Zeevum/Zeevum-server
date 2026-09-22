@@ -1,5 +1,3 @@
-//! Application context and the accept loop
-
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -13,10 +11,7 @@ use crate::hub::Hub;
 use crate::ratelimit::RateLimiter;
 use crate::tls;
 
-/// Everything a connection handler needs
-///
-/// Cheap to clone. The expensive parts are already shared behind an `Arc` or
-/// are copy-on-clone types themselves
+/// Cheap to clone, the expensive parts are already shared behind an `Arc`
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<Config>,
@@ -29,7 +24,6 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Opens the database, runs migrations and prepares the context
     pub async fn new(config: Config) -> Result<Self> {
         let pool = db::init_database(&config.db_path)
             .await
@@ -49,10 +43,8 @@ impl AppContext {
     }
 }
 
-/// Accepts TLS connections until the future is dropped
-///
 /// Takes the listener from the caller so that tests can bind an ephemeral port
-/// and learn its address before the server starts accepting
+/// before the server starts accepting
 pub async fn serve(ctx: AppContext, listener: TcpListener) -> Result<()> {
     let acceptor = TlsAcceptor::from(tls::load_tls_config(
         &ctx.config.tls_cert_path,

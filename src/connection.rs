@@ -1,5 +1,3 @@
-//! Per-client connection lifecycle. TLS accept, handshake, read loop
-
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncWriteExt, BufReader as AsyncBufReader, split};
@@ -42,10 +40,10 @@ pub async fn handle_client(
         }
     };
 
-    let user = match handshake::handshake(&mut tls_stream, peer_address, &ctx).await {
-        Ok(u) => {
+    let outcome = match handshake::handshake(&mut tls_stream, peer_address, &ctx).await {
+        Ok(o) => {
             ctx.rate_limiter.lock().unwrap().clear_attempts(&peer_ip);
-            u
+            o
         }
         Err(e) => {
             warning!(
@@ -54,10 +52,14 @@ pub async fn handle_client(
                 e.detail()
             );
 
+            // Only bad credentials count against the IP, a client that simply
+            // speaks the wrong protocol version is not attacking anything.
             if matches!(e, HandshakeError::Auth(..)) {
                 ctx.rate_limiter.lock().unwrap().record_failure(peer_ip);
             }
 
+            // The detail stays on the server, it can mention internals. The
+            // client gets the code and decides what to show.
             send(
                 &mut tls_stream,
                 &frame(&ServerMsg::Error {
@@ -70,26 +72,39 @@ pub async fn handle_client(
         }
     };
 
-    let (token, expires_at) =
-        match db::create_session(&ctx.pool, user.id, ctx.config.session_duration_hours).await {
-            Ok(t) => t,
-            Err(e) => {
-                error!("Failed to create session: {e}");
-                send(
-                    &mut tls_stream,
-                    &frame(&ServerMsg::Error {
-                        code: ErrorCode::Internal,
-                        detail: None,
-                    }),
-                )
-                .await;
-                return;
+    let (user, token, expires_at) = match outcome {
+        // Password and registration are where a token is born.
+        handshake::AuthOutcome::NewSession(user) => {
+            match db::create_session(&ctx.pool, user.id, ctx.config.session_duration_hours).await {
+                Ok((token, expires_at)) => (user, token, expires_at),
+                Err(e) => {
+                    error!("Failed to create session: {e}");
+                    send(
+                        &mut tls_stream,
+                        &frame(&ServerMsg::Error {
+                            code: ErrorCode::Internal,
+                            detail: None,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
             }
-        };
+        }
+        // The client arrived with a token, that row exists and validating it
+        // has just renewed the expiry, creating another one adds a row per reconnect.
+        handshake::AuthOutcome::ReusedSession(user, token, expires_at) => (user, token, expires_at),
+    };
+
+    // Ties this connection to its row in `sessions`, Logout needs it to revoke the right one.
+    let session_token = token.clone();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let tx_cleanup = tx.clone();
-    ctx.hub.register(user.user_id, tx);
+    // Lets the hub close this connection, which "log out everywhere" needs, without
+    // a signal the read loop would sit in read_frame until the client spoke.
+    let (kick_tx, mut kick_rx) = tokio::sync::watch::channel(false);
+    ctx.hub.register(user.user_id, tx, kick_tx);
 
     let (reader, mut writer) = split(tls_stream);
     let mut reader = AsyncBufReader::new(reader);
@@ -145,8 +160,14 @@ pub async fn handle_client(
     }
 
     loop {
-        let frame_res =
-            tokio::time::timeout(ctx.config.read_timeout, read_frame(&mut reader)).await;
+        let frame_res = tokio::select! {
+            res = tokio::time::timeout(ctx.config.read_timeout, read_frame(&mut reader)) => res,
+            // Revoked from the outside, the read future is dropped mid-flight.
+            _ = kick_rx.changed() => {
+                info!("Session revoked, closing {peer_address} ({user_login})");
+                break;
+            }
+        };
 
         match frame_res {
             Err(_) => {
@@ -183,7 +204,7 @@ pub async fn handle_client(
                     }
                 };
 
-                match handlers::dispatch(cmd, &user, &ctx).await {
+                match handlers::dispatch(cmd, &user, &ctx, &session_token).await {
                     Flow::Continue => {}
                     Flow::Disconnect => break,
                 }
@@ -196,7 +217,7 @@ pub async fn handle_client(
     trace!("Connection finished for: {peer_address} ({user_login})");
 }
 
-/// Writes a frame, ignoring transport errors
+/// Ignores transport errors, the caller drops the connection anyway.
 async fn send(stream: &mut TlsStream<TcpStream>, data: &str) {
     let _ = stream.write_all(data.as_bytes()).await;
     let _ = stream.flush().await;

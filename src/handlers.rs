@@ -1,7 +1,7 @@
-//! Dispatch of authenticated client commands (protocol v2)
+//! Dispatch of authenticated client commands, protocol v2.
 //!
 //! Everything is addressed by conversation, never by peer - that is what keeps
-//! group chats additive later
+//! group chats additive later.
 
 use uuid::Uuid;
 use zeevum_protocol::{ClientMsg, ErrorCode, MAX_MESSAGE_LEN, ServerMsg, UserBrief};
@@ -11,25 +11,19 @@ use crate::db::FriendReqOutcome;
 use crate::frames::frame;
 use crate::server::AppContext;
 
-/// What the connection loop should do once a command has been handled
 pub enum Flow {
-    /// Keep reading frames
     Continue,
-    /// Drop the connection
     Disconnect,
 }
 
-/// Sends a refusal the client can branch on
-///
-/// The detail stays on the server, it can mention internals, and the client is
-/// expected to render its own text for a code
+/// The detail stays on the server, the client renders its own text for a code.
 fn refuse(ctx: &AppContext, to_user_id: i64, code: ErrorCode) {
     let _ = ctx
         .hub
         .send_to(to_user_id, &frame(&ServerMsg::Error { code, detail: None }));
 }
 
-/// Reports a failure that the client cannot act on
+/// Reports a failure that the client cannot act on.
 fn fail(ctx: &AppContext, to_user_id: i64, what: &str, e: &anyhow::Error) {
     error!("{what}: {e}");
     refuse(ctx, to_user_id, ErrorCode::Internal);
@@ -42,7 +36,7 @@ fn brief(user: &db::User) -> UserBrief {
     }
 }
 
-/// Opens the direct conversation with a user, creating it on first use
+/// Opens the direct conversation with a user, creating it on first use.
 async fn on_resolve_dm(
     ctx: &AppContext,
     user: &db::User,
@@ -58,6 +52,9 @@ async fn on_resolve_dm(
         return Ok(Flow::Continue);
     };
 
+    // Nothing to open a conversation with, they have not agreed to one. This
+    // is about the relationship, not about membership, so it is not
+    // `NotAMember` - the client is expected to offer adding the peer.
     if !db::are_friends(&ctx.pool, &user.id, &peer.id).await? {
         refuse(ctx, user.user_id, ErrorCode::NotFriends);
         return Ok(Flow::Continue);
@@ -76,7 +73,7 @@ async fn on_resolve_dm(
     Ok(Flow::Continue)
 }
 
-/// Streams the history of a conversation the caller belongs to
+/// Streams the history of a conversation the caller belongs to.
 async fn on_history_req(ctx: &AppContext, user: &db::User, conv_id: Uuid) -> anyhow::Result<Flow> {
     if !db::is_member(&ctx.pool, &conv_id, &user.id).await? {
         refuse(ctx, user.user_id, ErrorCode::NotAMember);
@@ -98,12 +95,15 @@ async fn on_history_req(ctx: &AppContext, user: &db::User, conv_id: Uuid) -> any
         )
         .collect::<Vec<_>>();
 
+    // The query takes the newest N, but a chat reads top to bottom.
     history.reverse();
 
     for message in history {
         let _ = ctx.hub.send_to(user.user_id, &frame(&message));
     }
 
+    // Always terminated, even when empty, the client waits for this before it
+    // considers the conversation loaded.
     let _ = ctx
         .hub
         .send_to(user.user_id, &frame(&ServerMsg::HistoryEnd { conv_id }));
@@ -111,7 +111,6 @@ async fn on_history_req(ctx: &AppContext, user: &db::User, conv_id: Uuid) -> any
     Ok(Flow::Continue)
 }
 
-/// Stores a message and pushes it to the other participants
 async fn on_send_msg(
     ctx: &AppContext,
     user: &db::User,
@@ -131,6 +130,8 @@ async fn on_send_msg(
 
     db::save_chat_message(&ctx.pool, &message_id, &conv_id, &user.id, &content).await?;
 
+    // Acked only after the write went through, the client must not believe a
+    // message was stored when it was not.
     let _ = ctx.hub.send_to(
         user.user_id,
         &frame(&ServerMsg::MsgAck {
@@ -161,11 +162,9 @@ async fn on_send_msg(
     Ok(Flow::Continue)
 }
 
-/// Handles one command from an authenticated user
-///
-/// Every reply is pushed into the users outgoing queue in [`crate::hub::Hub`]
-/// a user that is not connected simply does not receive it
-pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext) -> Flow {
+/// Every reply goes through [`crate::hub::Hub`], a disconnected user simply
+/// does not receive it.
+pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext, token: &str) -> Flow {
     let user_id = user.id;
     let my_user_id = user.user_id;
 
@@ -221,6 +220,10 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext) -> Flow
                                 }),
                             );
                         }
+                        // Acknowledged, but deliberately not announced again,
+                        // the request is already on the other side's screen, and
+                        // re-announcing it is how the command would become a
+                        // notification pump.
                         Ok(FriendReqOutcome::AlreadyPending) => {
                             let _ = ctx.hub.send_to(
                                 my_user_id,
@@ -267,6 +270,7 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext) -> Flow
                                 }),
                             );
                         }
+                        // Nobody asked, so nobody is told they became friends.
                         Ok(false) => refuse(ctx, my_user_id, ErrorCode::NoPendingRequest),
                         Err(e) => fail(
                             ctx,
@@ -343,6 +347,8 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext) -> Flow
                         }),
                     );
                 }
+                // Not ours, or already read, the client is told nothing, which
+                // is what keeps a stale read receipt from flickering.
                 Ok(None) => {}
                 Err(e) => fail(
                     ctx,
@@ -352,6 +358,26 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext) -> Flow
                 ),
             }
             Flow::Continue
+        }
+
+        ClientMsg::Logout { all_sessions } => {
+            // The connection loop unregisters this socket on the way out, and only
+            // if the entry is still ours. The other devices have to be closed first,
+            // an open socket never re-checks whether its session exists.
+            if all_sessions {
+                ctx.hub.kick_all(my_user_id);
+            }
+
+            let revoked = if all_sessions {
+                db::revoke_all_sessions(&ctx.pool, user_id).await
+            } else {
+                db::revoke_session(&ctx.pool, token).await
+            };
+
+            if let Err(e) = revoked {
+                fail(ctx, my_user_id, "Logout", &e);
+            }
+            Flow::Disconnect
         }
     }
 }

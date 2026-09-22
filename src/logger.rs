@@ -44,7 +44,7 @@ struct LogEntry {
 static LOG_SENDER: OnceLock<mpsc::Sender<LogEntry>> = OnceLock::new();
 static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
 
-/// Инициализирует логгер. Должна вызываться первой в main()
+/// Initializes the logger. Must be called first in `main`
 pub fn init(app_name: &str, min_level: LogLevel) {
     let app_lowercase = app_name.to_lowercase();
     LOG_LEVEL.set(min_level).ok();

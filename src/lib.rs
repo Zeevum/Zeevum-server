@@ -1,8 +1,8 @@
-//! Zeevum server
+//! Zeevum server.
 //!
-//! The binary in `src/main.rs` is a thin wrapper around [`server::serve`]
+//! The binary in `src/main.rs` is a thin wrapper around [`server::serve`].
 //! Everything else lives here so that integration tests can start a real
-//! server on an ephemeral port with their own database and certificates
+//! server on an ephemeral port with their own database and certificates.
 
 #[macro_use]
 pub mod logger;

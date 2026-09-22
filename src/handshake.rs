@@ -1,5 +1,3 @@
-//! Authentication handshake. Protocol version, proof of work, credentials
-
 use std::net::SocketAddr;
 
 use tokio::io::AsyncWriteExt;
@@ -11,13 +9,10 @@ use crate::db;
 use crate::frames::{frame, read_frame};
 use crate::server::AppContext;
 
-/// Why a handshake was rejected, in the terms protocol v2 reports it, a
-/// machine readable code for the client and a detail string for the logs
+/// A machine-readable code for the client and a detail string for the logs.
 #[derive(Debug)]
 pub enum HandshakeError {
-    /// Credentials were wrong or the account could not be created
     Auth(ErrorCode, String),
-    /// The peer violated the protocol or a transport error occurred
     Protocol(ErrorCode, String),
 }
 
@@ -28,7 +23,7 @@ impl HandshakeError {
         }
     }
 
-    /// Human-readable context. Logged by the server, never relied upon by the client
+    /// Human-readable context. Logged by the server, never relied upon by the client.
     pub fn detail(&self) -> &str {
         match self {
             HandshakeError::Auth(_, detail) | HandshakeError::Protocol(_, detail) => detail,
@@ -36,12 +31,20 @@ impl HandshakeError {
     }
 }
 
-/// Performs the handshake on a freshly accepted TLS stream
+/// The distinction is about the `sessions` table, a client that arrived with a
+/// token already has a row and validating it renewed the expiry.
+pub enum AuthOutcome {
+    /// Password or registration, this is where a token is born.
+    NewSession(db::User),
+    /// Token, the row it belongs to, and the expiry it was just renewed to.
+    ReusedSession(db::User, String, i64),
+}
+
 pub async fn handshake(
     stream: &mut TlsStream<TcpStream>,
     peer: SocketAddr,
     ctx: &AppContext,
-) -> Result<db::User, HandshakeError> {
+) -> Result<AuthOutcome, HandshakeError> {
     use HandshakeError::{Auth, Protocol};
 
     let line = tokio::time::timeout(ctx.config.handshake_timeout, read_frame(stream))
@@ -119,26 +122,30 @@ pub async fn handshake(
         m => m,
     };
 
-    let user_result = match method {
+    let outcome = match method {
         AuthMethod::Token { token } => {
-            validate_session(&ctx.pool, &token, ctx.config.session_duration_hours).await
+            validate_session(&ctx.pool, &token, ctx.config.session_duration_hours)
+                .await
+                .map(|(user, expires_at)| AuthOutcome::ReusedSession(user, token, expires_at))
         }
         AuthMethod::Login { login, password } => {
-            login_user(&ctx.pool, &login, &password, &ctx.fake_hash).await
+            login_user(&ctx.pool, &login, &password, &ctx.fake_hash)
+                .await
+                .map(AuthOutcome::NewSession)
         }
-        AuthMethod::Register { login, password } => {
-            register_user(&ctx.pool, &login, &password).await
-        }
+        AuthMethod::Register { login, password } => register_user(&ctx.pool, &login, &password)
+            .await
+            .map(AuthOutcome::NewSession),
     };
 
-    user_result.map_err(|(code, detail)| Auth(code, detail))
+    outcome.map_err(|(code, detail)| Auth(code, detail))
 }
 
 async fn validate_session(
     pool: &sqlx::SqlitePool,
     token: &str,
     duration: f64,
-) -> Result<db::User, (ErrorCode, String)> {
+) -> Result<(db::User, i64), (ErrorCode, String)> {
     db::validate_session(pool, token, duration)
         .await
         .map_err(|e| (ErrorCode::Internal, format!("session lookup failed: {e}")))?
@@ -181,6 +188,8 @@ async fn login_user(
             return Ok(existing);
         }
     } else {
+        // Burn the same amount of time as a real verification, so that the
+        // response time does not reveal whether the login exists.
         let _ = db::verify_password(password, fake_hash);
     }
     Err((

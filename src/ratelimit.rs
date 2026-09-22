@@ -1,12 +1,8 @@
-//! Coarse per IP rate limiting for failed handshakes
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-/// Counts failed authentication attempts per IP within a sliding window
-///
-/// Note: entries are only removed on a successful authentication, so the map
+/// Entries are only removed on a successful authentication, so the map
 /// itself can still grow
 #[derive(Debug)]
 pub struct RateLimiter {
