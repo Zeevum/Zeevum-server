@@ -1,7 +1,7 @@
 DROP TABLE sessions;
 
 CREATE TABLE sessions (
-                          token_hash TEXT PRIMARY KEY NOT NULL, -- sha256(token), lowercase hex
+                          token_hash TEXT PRIMARY KEY NOT NULL,
                           user_id    BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                           expires_at INTEGER NOT NULL
 );

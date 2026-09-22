@@ -7,7 +7,7 @@ CREATE TABLE users (
 );
 
 CREATE TABLE sessions (
-                          token      TEXT PRIMARY KEY NOT NULL, -- TODO хранить sha256-хэш токена
+                          token      TEXT PRIMARY KEY NOT NULL,
                           user_id    BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                           expires_at INTEGER NOT NULL
 );
