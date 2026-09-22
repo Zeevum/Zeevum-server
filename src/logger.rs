@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,7 +41,8 @@ struct LogEntry {
     content: String,
 }
 
-static LOG_SENDER: OnceLock<mpsc::Sender<LogEntry>> = OnceLock::new();
+static LOG_SENDER: OnceLock<Mutex<Option<mpsc::Sender<LogEntry>>>> = OnceLock::new();
+static LOG_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
 
 /// Initializes the logger. Must be called first in `main`
@@ -50,14 +51,14 @@ pub fn init(app_name: &str, min_level: LogLevel) {
     LOG_LEVEL.set(min_level).ok();
 
     let (tx, rx) = mpsc::channel::<LogEntry>();
-    LOG_SENDER.set(tx).ok();
+    LOG_SENDER.set(Mutex::new(Some(tx))).ok();
 
     let log_dir = get_log_dir(app_name);
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Failed to create log directory: {e}");
     }
 
-    thread::Builder::new()
+    let handle = thread::Builder::new()
         .name("LoggerThread".into())
         .spawn(move || {
             let mut current_day = String::new();
@@ -103,6 +104,26 @@ pub fn init(app_name: &str, min_level: LogLevel) {
             }
         })
         .expect("Failed to spawn logger thread");
+    LOG_THREAD.set(Mutex::new(Some(handle))).ok();
+}
+
+/// The logger writes from its own thread, so `std::process::exit` drops
+/// whatever is still in the queue, which is how the last line before an
+/// exit went missing. Dropping the sender ends the loop and joining waits
+/// for it to drain.
+pub fn shutdown() {
+    if let Some(slot) = LOG_SENDER.get()
+        && let Ok(mut guard) = slot.lock()
+    {
+        *guard = None;
+    }
+
+    if let Some(slot) = LOG_THREAD.get()
+        && let Ok(mut guard) = slot.lock()
+        && let Some(handle) = guard.take()
+    {
+        let _ = handle.join();
+    }
 }
 
 fn get_log_dir(app_name: &str) -> PathBuf {
@@ -130,10 +151,19 @@ pub fn log(content: String, level: LogLevel) {
         return;
     }
 
-    if let Some(sender) = LOG_SENDER.get() {
-        let _ = sender.send(LogEntry { level, content });
-    } else {
+    let Some(slot) = LOG_SENDER.get() else {
         eprintln!("[{level}] (FALLBACK) {content}");
+        return;
+    };
+    let Ok(slot) = slot.lock() else {
+        eprintln!("[{level}] (FALLBACK) {content}");
+        return;
+    };
+    match slot.as_ref() {
+        Some(sender) => {
+            let _ = sender.send(LogEntry { level, content });
+        }
+        None => eprintln!("[{level}] (FALLBACK) {content}"),
     }
 }
 

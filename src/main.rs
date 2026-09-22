@@ -22,12 +22,13 @@ async fn main() {
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
-        std::thread::sleep(Duration::from_millis(50));
+        logger::shutdown();
         std::process::exit(0);
     });
 
     if let Err(e) = run(config).await {
         error!("Fatal error: {e:#}");
+        logger::shutdown();
         std::process::exit(1);
     }
 }
