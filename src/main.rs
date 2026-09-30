@@ -11,8 +11,29 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
+    // Before the config, not after: building it demands the TLS material,
+    // and `admin` will never use a certificate.
+    logger::init("Zeevum-server", Config::log_level_from_env());
+
+    let _ = ctrlc::set_handler(move || {
+        info!("Program exit with CTRL+C");
+        logger::shutdown();
+        std::process::exit(0);
+    });
+
+    // `admin` never serves: it opens the same database and exits, so the two
+    // never compete for the port.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("admin") {
+        if let Err(e) = zeevum_server::admin::run(&args[1..]).await {
+            error!("{e:#}");
+            logger::shutdown();
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = Config::from_env();
-    logger::init("Zeevum-server", config.log_level);
 
     info!(
         "Zeevum-server v{} starting (protocol v{})",
@@ -20,11 +41,10 @@ async fn main() {
         zeevum_protocol::PROTOCOL_VERSION
     );
 
-    let _ = ctrlc::set_handler(move || {
-        info!("Program exit with CTRL+C");
-        logger::shutdown();
-        std::process::exit(0);
-    });
+    // Resolved, because a relative DB_PATH means a different file depending
+    // on where the server was started from, and that is worth one line at
+    // startup rather than an afternoon.
+    info!("database: {}", Config::absolute(&config.db_path).display());
 
     if let Err(e) = run(config).await {
         error!("Fatal error: {e:#}");

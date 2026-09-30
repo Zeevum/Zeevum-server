@@ -24,6 +24,8 @@ pub struct User {
     pub user_id: i64,
     pub login: String,
     pub password: String,
+    /// Set by an admin reset. Locks the account to a password change.
+    pub must_change_password: bool,
     #[allow(dead_code)]
     pub created_at: DateTime<Local>,
 }
@@ -128,13 +130,14 @@ pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Res
         user_id,
         login: login.to_string(),
         password: hashed_password,
+        must_change_password: false,
         created_at: Local::now(),
     })
 }
 
 pub async fn get_user_by_login(pool: &SqlitePool, login: &str) -> Result<Option<User>> {
     let row =
-        sqlx::query("SELECT id, user_id, login, password, created_at FROM users WHERE login = ?")
+        sqlx::query("SELECT id, user_id, login, password, created_at, must_change_password FROM users WHERE login = ?")
             .bind(login)
             .fetch_optional(pool)
             .await?;
@@ -171,7 +174,21 @@ pub async fn create_session(
         .execute(pool)
         .await?;
 
+    touch_last_seen(pool, user_id).await?;
+
     Ok((token, expires_at))
+}
+
+/// Written on every successful login, by password or by token. It cannot be
+/// read out of `sessions` instead: the GC deletes expired rows, and with them
+/// the only trace of when somebody was last here.
+pub async fn touch_last_seen(pool: &SqlitePool, id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE users SET last_seen = ? WHERE id = ?")
+        .bind(Utc::now().timestamp())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn validate_session(
@@ -200,10 +217,13 @@ pub async fn validate_session(
             .await?;
 
         let user_row =
-            sqlx::query("SELECT id, user_id, login, password, created_at FROM users WHERE id = ?")
+            sqlx::query("SELECT id, user_id, login, password, created_at, must_change_password FROM users WHERE id = ?")
                 .bind(user_id)
                 .fetch_one(pool)
                 .await?;
+
+        // A token login is a login, and this is the only place that sees it.
+        touch_last_seen(pool, user_id).await?;
 
         return Ok(Some((map_row_to_user(&user_row)?, new_expires_at)));
     }
@@ -243,7 +263,7 @@ pub async fn delete_expired_sessions(pool: &SqlitePool) -> Result<u64> {
 
 pub async fn get_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<User>> {
     let row =
-        sqlx::query("SELECT id, user_id, login, password, created_at FROM users WHERE id = ?")
+        sqlx::query("SELECT id, user_id, login, password, created_at, must_change_password FROM users WHERE id = ?")
             .bind(id)
             .fetch_optional(pool)
             .await?;
@@ -293,6 +313,7 @@ fn map_row_to_user(row: &SqliteRow) -> Result<User> {
         user_id,
         login,
         password,
+        must_change_password: row.try_get("must_change_password")?,
         created_at,
     })
 }
@@ -385,19 +406,33 @@ pub async fn get_or_create_private_chat(
     Ok(chat_id)
 }
 
+/// Returns false when the message was already stored. A client retries a
+/// send whose acknowledgement never reached it, and the id is the one the
+/// client generated, so the retry carries the same one. The caller must not
+/// announce such a message a second time.
 pub async fn save_chat_message(
     pool: &SqlitePool,
     message_id: &Uuid,
     chat_id: &Uuid,
     sender_id: &Uuid,
     content: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let now = Utc::now().timestamp();
 
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .context("failed to begin transaction")?;
+
+    let already: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM messages WHERE id = ?")
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    if already.is_some() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     // One counter per conversation, so a seq is never handed out twice.
     // MAX(seq) + 1 would reuse the number of a deleted message, and a client
@@ -426,7 +461,84 @@ pub async fn save_chat_message(
 
     tx.commit().await?;
 
-    Ok(())
+    Ok(true)
+}
+
+/// What came of an attempt to replace a password.
+pub enum PasswordChange {
+    Done,
+    /// The current password did not match.
+    WrongPassword,
+    /// The new one would not have passed registration.
+    TooWeak,
+}
+
+/// The old password is asked for even though the session is already proven:
+/// a stolen token must not be enough to take the account over.
+pub async fn change_password(
+    pool: &SqlitePool,
+    id: Uuid,
+    old_password: &str,
+    new_password: &str,
+) -> Result<PasswordChange> {
+    let (hash,): (String,) = sqlx::query_as("SELECT password FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+
+    if !verify_password(old_password, &hash) {
+        return Ok(PasswordChange::WrongPassword);
+    }
+
+    if zxcvbn::zxcvbn(new_password, &[]).score() < Score::Two {
+        return Ok(PasswordChange::TooWeak);
+    }
+
+    let hashed = hash_password(new_password).context("hashing the new password")?;
+
+    sqlx::query("UPDATE users SET password = ?, must_change_password = 0 WHERE id = ?")
+        .bind(&hashed)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(PasswordChange::Done)
+}
+
+/// Whether the account is still locked. Read back rather than tracked, the
+/// database is the only thing that knows.
+pub async fn must_change_password(pool: &SqlitePool, id: Uuid) -> Result<bool> {
+    let (flag,): (i32,) = sqlx::query_as("SELECT must_change_password FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    Ok(flag != 0)
+}
+
+/// Everything but this one. The devices that hold the old tokens were issued
+/// against the password that is no longer in force.
+pub async fn revoke_other_sessions(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    keep_token: &str,
+) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?")
+        .bind(user_id)
+        .bind(token_hash(keep_token))
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// The expiry the session already has, so that a client handed its own login
+/// back gets the values it logged in with.
+pub async fn session_expiry(pool: &SqlitePool, token: &str) -> Result<Option<i64>> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT expires_at FROM sessions WHERE token_hash = ?")
+            .bind(token_hash(token))
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
 }
 
 /// Newest first, the caller is expected to reverse this before showing it.
@@ -501,7 +613,7 @@ pub async fn mark_message_as_read_checked(
 
 pub async fn get_user_by_user_id(pool: &SqlitePool, user_id: i64) -> Result<Option<User>> {
     let row =
-        sqlx::query("SELECT id, user_id, login, password, created_at FROM users WHERE user_id = ?")
+        sqlx::query("SELECT id, user_id, login, password, created_at, must_change_password FROM users WHERE user_id = ?")
             .bind(user_id)
             .fetch_optional(pool)
             .await?;
@@ -590,6 +702,50 @@ pub async fn get_friends_list(pool: &SqlitePool, user_id: &Uuid) -> Result<Vec<(
     }
 
     Ok(friends)
+}
+
+/// One conversation's unread count, as the database sees it.
+#[derive(Debug, PartialEq)]
+pub struct UnreadRow {
+    pub conv_id: Uuid,
+    pub peer_user_id: i64,
+    pub peer_login: String,
+    pub count: i64,
+}
+
+/// What the reader has not seen, per conversation. Only messages somebody
+/// else wrote count, the reader's own message is never unread to them.
+/// Private chats only, a group has no single peer to name. Conversations
+/// with nothing unread are left out, so an empty result is the normal case.
+pub async fn unread_summary(pool: &SqlitePool, user_id: &Uuid) -> Result<Vec<UnreadRow>> {
+    let rows = sqlx::query(
+        "SELECT c.id AS conv_id, u.user_id AS peer_user_id, u.login AS peer_login,
+                (SELECT COUNT(*) FROM messages m
+                  WHERE m.chat_id = c.id AND m.sender_id != ? AND m.is_read = 0) AS unread
+         FROM chats c
+         JOIN chat_members mine ON mine.chat_id = c.id AND mine.user_id = ?
+         JOIN chat_members theirs ON theirs.chat_id = c.id AND theirs.user_id != ?
+         JOIN users u ON u.id = theirs.user_id
+         WHERE c.type = 'private'",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(UnreadRow {
+            conv_id: row.try_get("conv_id")?,
+            peer_user_id: row.try_get("peer_user_id")?,
+            peer_login: row.try_get("peer_login")?,
+            count: row.try_get("unread")?,
+        });
+    }
+    out.retain(|row| row.count > 0);
+
+    Ok(out)
 }
 
 pub async fn get_pending_requests(pool: &SqlitePool, user_id: &Uuid) -> Result<Vec<(i64, String)>> {
@@ -1297,6 +1453,183 @@ mod tests {
         // Looking up the dead number finds nobody, it does not resurrect Alice.
         assert!(get_user_by_user_id(&pool, alice.user_id).await?.is_none());
 
+        Ok(())
+    }
+    /// Each side's count is what the other wrote. The reader's own message
+    /// is never unread to them.
+    #[tokio::test]
+    async fn unread_counts_only_what_the_other_side_wrote() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        save_chat_message(&pool, &Uuid::new_v4(), &chat, &bob.id, "one").await?;
+        save_chat_message(&pool, &Uuid::new_v4(), &chat, &bob.id, "two").await?;
+        save_chat_message(&pool, &Uuid::new_v4(), &chat, &alice.id, "three").await?;
+
+        let alice_rows = unread_summary(&pool, &alice.id).await?;
+        assert_eq!(alice_rows.len(), 1);
+        assert_eq!(alice_rows[0].count, 2);
+        assert_eq!(alice_rows[0].peer_login.to_lowercase(), "bob");
+
+        let bob_rows = unread_summary(&pool, &bob.id).await?;
+        assert_eq!(bob_rows.len(), 1);
+        assert_eq!(bob_rows[0].count, 1);
+        assert_eq!(bob_rows[0].peer_login.to_lowercase(), "alice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reading_a_message_takes_it_out_of_the_count() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        let first = Uuid::new_v4();
+        save_chat_message(&pool, &first, &chat, &bob.id, "one").await?;
+        save_chat_message(&pool, &Uuid::new_v4(), &chat, &bob.id, "two").await?;
+
+        assert_eq!(unread_summary(&pool, &alice.id).await?[0].count, 2);
+
+        mark_message_as_read_checked(&pool, &first, &alice.id).await?;
+        assert_eq!(unread_summary(&pool, &alice.id).await?[0].count, 1);
+        Ok(())
+    }
+
+    /// A count belongs to one conversation, it is not a total for the user.
+    #[tokio::test]
+    async fn counts_stay_separate_per_conversation() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let carol = add_user(&pool, "Carol", "third_password_789_C!").await?;
+        let with_bob = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+        let with_carol = get_or_create_private_chat(&pool, &alice.id, &carol.id).await?;
+
+        save_chat_message(&pool, &Uuid::new_v4(), &with_bob, &bob.id, "hi").await?;
+        for _ in 0..3 {
+            save_chat_message(&pool, &Uuid::new_v4(), &with_carol, &carol.id, "hi").await?;
+        }
+
+        let rows = unread_summary(&pool, &alice.id).await?;
+        assert_eq!(rows.len(), 2);
+        let by_peer: Vec<(String, i64)> = rows
+            .into_iter()
+            .map(|r| (r.peer_login.to_lowercase(), r.count))
+            .collect();
+        assert!(by_peer.contains(&("bob".to_string(), 1)));
+        assert!(by_peer.contains(&("carol".to_string(), 3)));
+        Ok(())
+    }
+
+    /// A retry carries the id the client generated, so the second copy of the
+    /// same send is recognised and not stored again.
+    #[tokio::test]
+    async fn a_retried_send_is_stored_once() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        let id = Uuid::new_v4();
+        assert!(save_chat_message(&pool, &id, &chat, &alice.id, "hello").await?);
+        assert!(!save_chat_message(&pool, &id, &chat, &alice.id, "hello").await?);
+
+        let history = get_chat_history(&pool, &chat, 50).await?;
+        assert_eq!(history.len(), 1);
+        Ok(())
+    }
+
+    /// The lock is the whole point: it has to come off, and the device that
+    /// changed the password has to survive while the others do not.
+    #[tokio::test]
+    async fn a_password_change_clears_the_lock_and_keeps_this_device() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "correct horse battery staple 7!").await?;
+
+        sqlx::query("UPDATE users SET must_change_password = 1 WHERE id = ?")
+            .bind(alice.id)
+            .execute(&pool)
+            .await?;
+
+        let (mine, _) = create_session(&pool, alice.id, 24.0).await?;
+        let (theirs, _) = create_session(&pool, alice.id, 24.0).await?;
+
+        let new_one = "another horse battery staple 9!";
+        assert!(matches!(
+            change_password(&pool, alice.id, "correct horse battery staple 7!", new_one).await?,
+            PasswordChange::Done
+        ));
+
+        assert!(
+            !must_change_password(&pool, alice.id).await?,
+            "the lock stayed on"
+        );
+        revoke_other_sessions(&pool, alice.id, &mine).await?;
+
+        assert!(
+            validate_session(&pool, &mine, 24.0).await?.is_some(),
+            "this device was dropped"
+        );
+        assert!(
+            validate_session(&pool, &theirs, 24.0).await?.is_none(),
+            "the other device kept its token"
+        );
+
+        let (hash,): (String,) = sqlx::query_as("SELECT password FROM users WHERE id = ?")
+            .bind(alice.id)
+            .fetch_one(&pool)
+            .await?;
+        assert!(verify_password(new_one, &hash));
+        assert!(!verify_password("correct horse battery staple 7!", &hash));
+        Ok(())
+    }
+
+    /// A stolen token must not be enough to take an account over, so the
+    /// current password is asked for even though the session is proven.
+    #[tokio::test]
+    async fn a_password_change_needs_the_current_password() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "correct horse battery staple 7!").await?;
+
+        assert!(matches!(
+            change_password(&pool, alice.id, "not it", "another horse battery staple 9!").await?,
+            PasswordChange::WrongPassword
+        ));
+        assert!(must_change_password(&pool, alice.id).await? == false);
+        Ok(())
+    }
+
+    /// The same bar as registration, otherwise the user is handed a password
+    /// the server would have refused to accept from them.
+    #[tokio::test]
+    async fn a_new_password_has_to_be_strong_enough() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "correct horse battery staple 7!").await?;
+
+        assert!(matches!(
+            change_password(
+                &pool,
+                alice.id,
+                "correct horse battery staple 7!",
+                "password"
+            )
+            .await?,
+            PasswordChange::TooWeak
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_conversation_with_nothing_unread_is_left_out() -> Result<()> {
+        let pool = setup_pool().await?;
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        assert!(unread_summary(&pool, &alice.id).await?.is_empty());
         Ok(())
     }
 }

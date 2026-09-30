@@ -7,6 +7,7 @@
 #[macro_use]
 pub mod logger;
 
+pub mod admin;
 pub mod config;
 pub mod connection;
 pub mod db;

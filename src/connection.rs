@@ -4,7 +4,7 @@ use tokio::io::{AsyncWriteExt, BufReader as AsyncBufReader, split};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use zeevum_protocol::{ClientMsg, ErrorCode, ServerMsg, UserBrief, decode};
+use zeevum_protocol::{ClientMsg, ErrorCode, ServerMsg, UnreadEntry, UserBrief, decode};
 
 use crate::db;
 use crate::frames::{frame, read_frame};
@@ -72,7 +72,7 @@ pub async fn handle_client(
         }
     };
 
-    let (user, token, expires_at) = match outcome {
+    let (mut user, token, expires_at) = match outcome {
         // Password and registration are where a token is born.
         handshake::AuthOutcome::NewSession(user) => {
             match db::create_session(&ctx.pool, user.id, ctx.config.session_duration_hours).await {
@@ -130,6 +130,7 @@ pub async fn handle_client(
             user_id: user.user_id,
             token,
             expires_at,
+            must_change_password: user.must_change_password,
         }),
     );
 
@@ -157,6 +158,28 @@ pub async fn handle_client(
                 .send_to(user.user_id, &frame(&ServerMsg::PendingReqs { entries }));
         }
         Err(e) => error!("Failed to load pending requests for {user_login}: {e}"),
+    }
+
+    // After the friend list, never before it. The client empties its counts
+    // when the list arrives, so a summary sent first would be wiped.
+    match db::unread_summary(&ctx.pool, &user.id).await {
+        Ok(rows) => {
+            let entries = rows
+                .into_iter()
+                .map(|row| UnreadEntry {
+                    conv_id: row.conv_id,
+                    peer: UserBrief {
+                        user_id: row.peer_user_id,
+                        login: row.peer_login,
+                    },
+                    count: row.count as u32,
+                })
+                .collect();
+            let _ = ctx
+                .hub
+                .send_to(user.user_id, &frame(&ServerMsg::UnreadSummary { entries }));
+        }
+        Err(e) => error!("Failed to load unread counts for {user_login}: {e}"),
     }
 
     loop {
@@ -204,8 +227,36 @@ pub async fn handle_client(
                     }
                 };
 
+                // A password that has to be replaced locks the account until
+                // it is. Checked here, in front of the dispatch and not
+                // inside it, so that there is no way past: not by sending
+                // some other frame first, and not through a handler that
+                // forgets to guard itself.
+                if user.must_change_password && !is_change_password(&cmd) {
+                    let _ = ctx.hub.send_to(
+                        user.user_id,
+                        &frame(&ServerMsg::Error {
+                            code: ErrorCode::MustChangePassword,
+                            detail: None,
+                        }),
+                    );
+                    continue;
+                }
+
+                let changed = is_change_password(&cmd);
+
                 match handlers::dispatch(cmd, &user, &ctx, &session_token).await {
-                    Flow::Continue => {}
+                    Flow::Continue => {
+                        if changed {
+                            // Read back rather than assumed: the database is
+                            // the only thing that knows whether the lock is
+                            // gone, and failing closed keeps it.
+                            user.must_change_password =
+                                db::must_change_password(&ctx.pool, user.id)
+                                    .await
+                                    .unwrap_or(true);
+                        }
+                    }
                     Flow::Disconnect => break,
                 }
             }
@@ -215,6 +266,11 @@ pub async fn handle_client(
     ctx.hub.unregister_if(user.user_id, &tx_cleanup);
     write_task.abort();
     trace!("Connection finished for: {peer_address} ({user_login})");
+}
+
+/// The one frame a locked account is allowed to send.
+fn is_change_password(cmd: &ClientMsg) -> bool {
+    matches!(cmd, ClientMsg::ChangePassword { .. })
 }
 
 /// Ignores transport errors, the caller drops the connection anyway.

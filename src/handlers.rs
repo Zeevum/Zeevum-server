@@ -128,10 +128,12 @@ async fn on_send_msg(
         return Ok(Flow::Continue);
     }
 
-    db::save_chat_message(&ctx.pool, &message_id, &conv_id, &user.id, &content).await?;
+    let stored =
+        db::save_chat_message(&ctx.pool, &message_id, &conv_id, &user.id, &content).await?;
 
     // Acked only after the write went through, the client must not believe a
-    // message was stored when it was not.
+    // message was stored when it was not. A retry is acked too: the message
+    // is stored, it was the first acknowledgement that went missing.
     let _ = ctx.hub.send_to(
         user.user_id,
         &frame(&ServerMsg::MsgAck {
@@ -139,6 +141,10 @@ async fn on_send_msg(
             conv_id,
         }),
     );
+
+    if !stored {
+        return Ok(Flow::Continue);
+    }
 
     let timestamp = chrono::Utc::now().timestamp();
     let recipients = db::member_user_ids(&ctx.pool, &conv_id).await?;
@@ -167,6 +173,9 @@ async fn on_send_msg(
 pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext, token: &str) -> Flow {
     let user_id = user.id;
     let my_user_id = user.user_id;
+    // The session this arrived on, named for what it is used for here: the one
+    // device that survives a password change.
+    let session_token = token;
 
     match cmd {
         ClientMsg::Auth { .. } => {
@@ -356,6 +365,65 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext, token: 
                     &format!("MarkRead from {}", user.login),
                     &e,
                 ),
+            }
+            Flow::Continue
+        }
+
+        ClientMsg::ChangePassword {
+            old_password,
+            new_password,
+        } => {
+            match db::change_password(&ctx.pool, user.id, &old_password, &new_password).await {
+                Ok(db::PasswordChange::Done) => {
+                    // The other devices hold tokens issued against a password
+                    // that is no longer in force.
+                    if let Err(e) =
+                        db::revoke_other_sessions(&ctx.pool, user.id, session_token).await
+                    {
+                        fail(ctx, user.user_id, "ChangePassword", &e);
+                    }
+
+                    // AuthOk again, with the flag cleared. One path out of the
+                    // lock, the same one that led into it, so the client needs
+                    // nothing new to understand that it is free.
+                    let expires_at = match db::session_expiry(&ctx.pool, session_token).await {
+                        Ok(Some(at)) => at,
+                        Ok(None) => 0,
+                        Err(e) => {
+                            fail(ctx, user.user_id, "ChangePassword", &e);
+                            0
+                        }
+                    };
+
+                    let _ = ctx.hub.send_to(
+                        user.user_id,
+                        &frame(&ServerMsg::AuthOk {
+                            user_id: user.user_id,
+                            token: session_token.to_string(),
+                            expires_at,
+                            must_change_password: false,
+                        }),
+                    );
+                }
+                Ok(db::PasswordChange::WrongPassword) => {
+                    let _ = ctx.hub.send_to(
+                        user.user_id,
+                        &frame(&ServerMsg::Error {
+                            code: ErrorCode::InvalidCredentials,
+                            detail: None,
+                        }),
+                    );
+                }
+                Ok(db::PasswordChange::TooWeak) => {
+                    let _ = ctx.hub.send_to(
+                        user.user_id,
+                        &frame(&ServerMsg::Error {
+                            code: ErrorCode::RegistrationFailed,
+                            detail: None,
+                        }),
+                    );
+                }
+                Err(e) => fail(ctx, user.user_id, "ChangePassword", &e),
             }
             Flow::Continue
         }
