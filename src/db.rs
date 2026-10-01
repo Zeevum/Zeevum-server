@@ -1598,7 +1598,7 @@ mod tests {
             change_password(&pool, alice.id, "not it", "another horse battery staple 9!").await?,
             PasswordChange::WrongPassword
         ));
-        assert!(must_change_password(&pool, alice.id).await? == false);
+        assert!(!must_change_password(&pool, alice.id).await?);
         Ok(())
     }
 
