@@ -90,6 +90,18 @@ async fn allocate_user_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Resul
 }
 
 pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Result<User> {
+    add_user_with(pool, login, raw_password, None).await
+}
+
+/// The code is claimed in the same transaction that creates the account:
+/// a registration that fails for a taken login leaves the code usable, and
+/// two registrations racing on one code cannot both spend it.
+pub async fn add_user_with(
+    pool: &SqlitePool,
+    login: &str,
+    raw_password: &str,
+    invite: Option<&str>,
+) -> Result<User> {
     if !validate_login(login) {
         anyhow::bail!("invalid login: must be 3-32 letters, numbers or underscores");
     }
@@ -122,6 +134,22 @@ pub async fn add_user(pool: &SqlitePool, login: &str, raw_password: &str) -> Res
     .bind(now)
     .execute(&mut *tx)
     .await?;
+
+    if let Some(code) = invite {
+        let claimed = sqlx::query(
+            "UPDATE invite_codes SET used_by = ?, used_at = ? \
+             WHERE code = ? AND used_by IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+        )
+        .bind(id)
+        .bind(now)
+        .bind(code)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            anyhow::bail!("invite code is invalid, expired, or already used");
+        }
+    }
 
     tx.commit().await.context("commit registration")?;
 
@@ -539,6 +567,22 @@ pub async fn session_expiry(pool: &SqlitePool, token: &str) -> Result<Option<i64
             .fetch_optional(pool)
             .await?;
     Ok(row.map(|r| r.0))
+}
+
+/// Whether a code would be accepted, without spending it. The transaction
+/// in [`add_user_with`] decides for real; this is the cheap check that
+/// keeps a bad code from costing a proof of work.
+pub async fn invite_code_valid(pool: &SqlitePool, code: &str) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM invite_codes \
+         WHERE code = ? AND used_by IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(code)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }
 
 /// Newest first, the caller is expected to reverse this before showing it.
@@ -1599,6 +1643,85 @@ mod tests {
             PasswordChange::WrongPassword
         ));
         assert!(!must_change_password(&pool, alice.id).await?);
+        Ok(())
+    }
+
+    /// A code is spent by the registration that used it and by nothing
+    /// else: a registration that fails for a taken login leaves it usable.
+    #[tokio::test]
+    async fn an_invite_code_is_spent_only_by_a_successful_registration() -> Result<()> {
+        let pool = setup_pool().await?;
+        let now = Utc::now().timestamp();
+        sqlx::query("INSERT INTO invite_codes (code, created_at) VALUES ('CODE1234', ?)")
+            .bind(now)
+            .execute(&pool)
+            .await?;
+
+        add_user(&pool, "Alice", "correct horse battery staple 7!").await?;
+        assert!(
+            add_user_with(
+                &pool,
+                "Alice",
+                "another horse battery staple 9!",
+                Some("CODE1234")
+            )
+            .await
+            .is_err()
+        );
+        assert!(invite_code_valid(&pool, "CODE1234").await?);
+
+        let bob = add_user_with(
+            &pool,
+            "Bob",
+            "another horse battery staple 9!",
+            Some("CODE1234"),
+        )
+        .await?;
+        assert!(!invite_code_valid(&pool, "CODE1234").await?);
+
+        assert!(
+            add_user_with(
+                &pool,
+                "Carol",
+                "third horse battery staple 2!",
+                Some("CODE1234")
+            )
+            .await
+            .is_err()
+        );
+
+        let (spent_by,): (String,) = sqlx::query_as(
+            "SELECT u.login FROM invite_codes i JOIN users u ON u.id = i.used_by WHERE i.code = 'CODE1234'",
+        )
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(spent_by, bob.login);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_expired_invite_code_is_refused() -> Result<()> {
+        let pool = setup_pool().await?;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO invite_codes (code, created_at, expires_at) VALUES ('OLDCODE1', ?, ?)",
+        )
+        .bind(now)
+        .bind(now - 1)
+        .execute(&pool)
+        .await?;
+
+        assert!(!invite_code_valid(&pool, "OLDCODE1").await?);
+        assert!(
+            add_user_with(
+                &pool,
+                "Alice",
+                "correct horse battery staple 7!",
+                Some("OLDCODE1")
+            )
+            .await
+            .is_err()
+        );
         Ok(())
     }
 

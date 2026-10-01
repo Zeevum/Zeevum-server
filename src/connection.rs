@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use tokio::io::{AsyncWriteExt, BufReader as AsyncBufReader, split};
 use tokio::net::TcpStream;
@@ -10,6 +11,7 @@ use crate::db;
 use crate::frames::{frame, read_frame};
 use crate::handlers::{self, Flow};
 use crate::handshake::{self, HandshakeError};
+use crate::ratelimit::{TokenBucket, Verdict};
 use crate::server::AppContext;
 
 pub async fn handle_client(
@@ -21,8 +23,18 @@ pub async fn handle_client(
     let peer_ip = peer_address.ip();
 
     {
-        let limiter = ctx.rate_limiter.lock().unwrap();
-        if limiter.is_blocked(&peer_ip) {
+        // L4 first: it counts connections and refuses the excess before
+        // TLS, so a flooding address never costs a handshake. L1 next: an
+        // address that has failed too many handshakes is not served
+        // either. One lock for both, the critical section is a handful of
+        // instructions.
+        let mut limiter = ctx.rate_limiter.lock().unwrap();
+        let now = Instant::now();
+        if !limiter.connection_allowed(peer_ip, now) {
+            warning!("Connection from {peer_address} cut: too many connections from this address");
+            return;
+        }
+        if limiter.handshake_blocked(peer_ip, now) {
             warning!("Connection from {peer_address} blocked due to rate limit");
             return;
         }
@@ -42,7 +54,10 @@ pub async fn handle_client(
 
     let outcome = match handshake::handshake(&mut tls_stream, peer_address, &ctx).await {
         Ok(o) => {
-            ctx.rate_limiter.lock().unwrap().clear_attempts(&peer_ip);
+            ctx.rate_limiter
+                .lock()
+                .unwrap()
+                .clear_handshake_failures(peer_ip, Instant::now());
             o
         }
         Err(e) => {
@@ -55,7 +70,10 @@ pub async fn handle_client(
             // Only bad credentials count against the IP, a client that simply
             // speaks the wrong protocol version is not attacking anything.
             if matches!(e, HandshakeError::Auth(..)) {
-                ctx.rate_limiter.lock().unwrap().record_failure(peer_ip);
+                ctx.rate_limiter
+                    .lock()
+                    .unwrap()
+                    .record_handshake_failure(peer_ip, Instant::now());
             }
 
             // The detail stays on the server, it can mention internals. The
@@ -182,6 +200,11 @@ pub async fn handle_client(
         Err(e) => error!("Failed to load unread counts for {user_login}: {e}"),
     }
 
+    // L3: frames per connection. It lives here, in the connection, because
+    // two connections of one user are two buckets, and none of this needs
+    // a lock.
+    let mut bucket = TokenBucket::new(ctx.config.msg_burst, ctx.config.msg_per_sec);
+
     loop {
         let frame_res = tokio::select! {
             res = tokio::time::timeout(ctx.config.read_timeout, read_frame(&mut reader)) => res,
@@ -226,6 +249,18 @@ pub async fn handle_client(
                         break;
                     }
                 };
+
+                // The frame pays its token before it is allowed to cost a
+                // database write. A locked account pays too: ChangePassword
+                // spam is still spam.
+                match bucket.verdict(Instant::now()) {
+                    Verdict::Now => {}
+                    Verdict::Wait(how_long) => tokio::time::sleep(how_long).await,
+                    Verdict::Cut => {
+                        warning!("Cutting {peer_address} ({user_login}): frame flood");
+                        break;
+                    }
+                }
 
                 // A password that has to be replaced locks the account until
                 // it is. Checked here, in front of the dispatch and not

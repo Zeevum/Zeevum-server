@@ -19,6 +19,7 @@ use zeevum_protocol::{
     AuthMethod, ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, decode, encode, pow,
 };
 
+use zeevum_server::config::RegistrationMode;
 use zeevum_server::logger::LogLevel;
 use zeevum_server::{AppContext, Config, serve};
 
@@ -38,6 +39,12 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// The same server with the limits turned up or down: the abuse tests
+    /// need tight ones, everything else needs headroom.
+    pub async fn start_with(tune: impl FnOnce(&mut Config)) -> Self {
         INIT.call_once(|| {
             // The binary does this in `main`, a test binary has to do it itself.
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -62,7 +69,7 @@ impl TestServer {
             CertificateDer::from_pem_slice(cert_pem.as_bytes()).expect("parse cert der");
         roots.add(der).expect("add root");
 
-        let config = Config {
+        let mut config = Config {
             server_address: "127.0.0.1:0".to_string(),
             db_path: dir.path().join("test.sqlite"),
             read_timeout: Duration::from_secs(10),
@@ -72,8 +79,16 @@ impl TestServer {
             // Weak keeps PoW solving negligible inside tests.
             pow_difficulty: Difficulty::Weak,
             session_duration_hours: 24.0,
+            // Headroom, not production values: these tests are about
+            // everything except the limiter and must never notice it.
+            reg_per_ip_per_hour: 1000,
+            msg_burst: 1000,
+            msg_per_sec: 1000,
+            conn_per_ip_per_10s: 1000,
+            registration: RegistrationMode::Open,
             log_level: LogLevel::Error,
         };
+        tune(&mut config);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -201,6 +216,7 @@ pub async fn register(client: &mut TestClient, login: &str, password: &str) -> S
         AuthMethod::Register {
             login: login.to_string(),
             password: password.to_string(),
+            invite_code: None,
         },
     )
     .await

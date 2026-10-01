@@ -2,9 +2,48 @@ use crate::{db, logger};
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 use zeevum_protocol::pow::Difficulty;
+
+/// Where the `.env` was found, when there was one. A relative path written
+/// in it is relative to the file, not to the directory the binary happened
+/// to start from.
+static ENV_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Called once from `main`, before anything reads the environment.
+pub fn set_env_dir(dir: PathBuf) {
+    let _ = ENV_DIR.set(dir);
+}
+
+fn base_dir() -> PathBuf {
+    ENV_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| env::current_dir().expect("no .env and no working directory"))
+}
+
+/// Who may create an account. `Open` is the behaviour of a server before
+/// invitations existed, and the default for the same reason: an upgrade
+/// must not lock anybody out before the operator has chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationMode {
+    Open,
+    Invite,
+    Closed,
+}
+
+impl RegistrationMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "open" => Some(Self::Open),
+            "invite" => Some(Self::Invite),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -16,6 +55,14 @@ pub struct Config {
     pub tls_key_path: PathBuf,
     pub pow_difficulty: Difficulty,
     pub session_duration_hours: f64,
+    /// Rate limits, see `ratelimit.rs`. Every one of them is a small
+    /// number on purpose: this is a self-hosted server, the defaults are
+    /// for a household, not a city.
+    pub reg_per_ip_per_hour: u32,
+    pub msg_burst: u32,
+    pub msg_per_sec: u32,
+    pub conn_per_ip_per_10s: u32,
+    pub registration: RegistrationMode,
     pub log_level: logger::LogLevel,
 }
 
@@ -34,7 +81,14 @@ impl Config {
     /// is missing.
     pub fn db_path_from_env() -> PathBuf {
         match env::var("DB_PATH") {
-            Ok(val) if !val.trim().is_empty() => PathBuf::from(val),
+            Ok(val) if !val.trim().is_empty() => {
+                let path = PathBuf::from(val);
+                if path.is_absolute() {
+                    path
+                } else {
+                    base_dir().join(path)
+                }
+            }
             _ => db::get_db_path().expect("Failed to build default DB path"),
         }
     }
@@ -105,6 +159,19 @@ impl Config {
             .filter(|&t| t > 0.0)
             .unwrap_or(720.0);
 
+        let reg_per_ip_per_hour = positive_env_u32("REG_PER_IP_PER_HOUR", 3);
+        let msg_burst = positive_env_u32("MSG_BURST", 30);
+        let msg_per_sec = positive_env_u32("MSG_PER_SEC", 5);
+        let conn_per_ip_per_10s = positive_env_u32("CONN_PER_IP_PER_10S", 5);
+
+        let registration = match env::var("REGISTRATION") {
+            Ok(value) => RegistrationMode::parse(&value).unwrap_or_else(|| {
+                eprintln!("Unknown REGISTRATION value '{value}', falling back to open");
+                RegistrationMode::Open
+            }),
+            Err(_) => RegistrationMode::Open,
+        };
+
         Self {
             server_address,
             db_path: Self::db_path_from_env(),
@@ -114,7 +181,33 @@ impl Config {
             tls_key_path,
             pow_difficulty,
             session_duration_hours,
+            reg_per_ip_per_hour,
+            msg_burst,
+            msg_per_sec,
+            conn_per_ip_per_10s,
+            registration,
             log_level: Self::log_level_from_env(),
+        }
+    }
+}
+
+/// A positive whole number from the environment, or the default. Zero is
+/// refused rather than clamped: a limit of zero means "block everyone",
+/// which nobody sets on purpose.
+fn positive_env_u32(name: &str, default: u32) -> u32 {
+    match env::var(name) {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("Unknown {name} value '{value}', falling back to {default}");
+                default
+            }
+        },
+        Err(_) => {
+            trace!(
+                "Environment parameter '{name}' not found. Default value will be used: {default}"
+            );
+            default
         }
     }
 }

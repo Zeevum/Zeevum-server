@@ -47,6 +47,13 @@ const READ_AUDIT: &str =
 type AuditRow = (i64, String, String, Option<String>, Option<String>);
 
 /// What the tests hold this module to. Kept next to the statements it lists,
+const INSERT_INVITE: &str =
+    "INSERT INTO invite_codes (code, created_at, expires_at) VALUES (?, ?, ?)";
+const LIST_INVITES: &str = "SELECT i.code, i.created_at, i.expires_at, i.used_at, u.login \
+                            FROM invite_codes i LEFT JOIN users u ON u.id = i.used_by \
+                            ORDER BY i.created_at DESC";
+const REVOKE_INVITE: &str = "DELETE FROM invite_codes WHERE code = ? AND used_by IS NULL";
+
 /// and the statements are only ever used through these constants, so the list
 /// cannot fall behind the code.
 pub const ALL_QUERIES: &[(&str, &str)] = &[
@@ -64,6 +71,9 @@ pub const ALL_QUERIES: &[(&str, &str)] = &[
     ("list_sessions_of", LIST_SESSIONS_OF),
     ("audit", AUDIT),
     ("read_audit", READ_AUDIT),
+    ("insert_invite", INSERT_INVITE),
+    ("list_invites", LIST_INVITES),
+    ("revoke_invite", REVOKE_INVITE),
 ];
 
 // ---------------------------------------------------------------------------
@@ -228,7 +238,7 @@ pub async fn revoke_sessions(pool: &SqlitePool, login: &str) -> Result<()> {
 pub async fn reset_password(pool: &SqlitePool, login: &str) -> Result<()> {
     let _user = user_by_login(pool, login).await?;
 
-    let temporary = temporary_password();
+    let temporary = random_code();
     let hash = db::hash_password(&temporary).context("hashing the temporary password")?;
 
     sqlx::query(SET_TEMPORARY_PASSWORD)
@@ -302,7 +312,7 @@ async fn count_of(pool: &SqlitePool, id: &uuid::Uuid) -> Result<i64> {
 
 /// Random, and uniform: bytes outside the alphabet are thrown away rather
 /// than folded, which a modulo would not do.
-fn temporary_password() -> String {
+fn random_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
     const LENGTH: usize = 16;
 
@@ -370,7 +380,10 @@ usage: Zeevum-server admin <command> [login]
   revoke-sessions <login>  end every session they have
   reset-password <login>   a temporary one, must be changed at next login
   audit [n]                the last n things done, refused ones included
-  stats                    whole numbers about the server";
+  stats                    whole numbers about the server
+  invite-new [days]        issue an invite code, optionally expiring in N days
+  invite-list              every code: created, expiry, who spent it
+  invite-revoke <code>     kill a code that has not been used";
 
 pub async fn run(args: &[String]) -> Result<()> {
     let command = match args.first().map(|s| s.as_str()) {
@@ -412,7 +425,10 @@ async fn dispatch_audited(pool: &SqlitePool, command: &str, target: Option<&str>
 }
 
 async fn dispatch(pool: &SqlitePool, command: &str, target: Option<&str>) -> Result<()> {
-    let needs_login = !matches!(command, "list-users" | "stats" | "audit");
+    let needs_login = !matches!(
+        command,
+        "list-users" | "stats" | "audit" | "invite-new" | "invite-list" | "invite-revoke"
+    );
 
     let login = match target {
         Some(l) => l,
@@ -438,10 +454,76 @@ async fn dispatch(pool: &SqlitePool, command: &str, target: Option<&str>) -> Res
             audit(pool, limit).await
         }
         "stats" => stats(pool).await,
+        "invite-new" => invite_new(pool, target).await,
+        "invite-list" => invite_list(pool).await,
+        "invite-revoke" => match target {
+            Some(code) => invite_revoke(pool, code).await,
+            None => Err(anyhow!("invite-revoke needs a code")),
+        },
         other => {
             println!("{USAGE}");
             Err(anyhow!("unknown admin subcommand '{other}'"))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invites
+// ---------------------------------------------------------------------------
+
+/// One row of `invite-list`.
+type InviteRow = (String, i64, Option<i64>, Option<i64>, Option<String>);
+
+async fn invite_new(pool: &SqlitePool, days: Option<&str>) -> Result<()> {
+    let expires_at = match days {
+        Some(d) => {
+            let days: i64 = d
+                .parse()
+                .context("the number of days must be a whole number")?;
+            Some(Utc::now().timestamp() + days * 86_400)
+        }
+        None => None,
+    };
+
+    let code = random_code();
+    sqlx::query(INSERT_INVITE)
+        .bind(&code)
+        .bind(Utc::now().timestamp())
+        .bind(expires_at)
+        .execute(pool)
+        .await?;
+
+    match expires_at {
+        Some(at) => println!("invite: {code} (expires {})", stamp(Some(at))),
+        None => println!("invite: {code} (no expiry)"),
+    }
+    Ok(())
+}
+
+async fn invite_list(pool: &SqlitePool) -> Result<()> {
+    let rows: Vec<InviteRow> = sqlx::query_as(LIST_INVITES).fetch_all(pool).await?;
+
+    for (code, created, expires, used_at, used_by) in rows {
+        let spent = match (used_by, used_at) {
+            (Some(login), Some(at)) => format!("{login} at {}", stamp(Some(at))),
+            _ => "unused".to_string(),
+        };
+        println!(
+            "{code}  created {}  expires {}  {spent}",
+            stamp(Some(created)),
+            stamp(expires)
+        );
+    }
+    Ok(())
+}
+
+async fn invite_revoke(pool: &SqlitePool, code: &str) -> Result<()> {
+    let result = sqlx::query(REVOKE_INVITE).bind(code).execute(pool).await?;
+    if result.rows_affected() == 1 {
+        println!("invite {code} revoked");
+        Ok(())
+    } else {
+        Err(anyhow!("no unused invite {code}"))
     }
 }
 
@@ -521,6 +603,67 @@ mod tests {
 
     /// Refusals included: a log of successes only is a log of the wrong
     /// things.
+    #[tokio::test]
+    async fn issuing_an_invite_leaves_a_row_and_an_audit_row() -> Result<()> {
+        let pool = setup_pool().await?;
+        dispatch_audited(&pool, "invite-new", None).await?;
+
+        let (codes,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM invite_codes")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(codes, 1);
+        assert_eq!(audit_rows(&pool).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invite_new_with_a_number_of_days_sets_the_expiry() -> Result<()> {
+        let pool = setup_pool().await?;
+        dispatch_audited(&pool, "invite-new", Some("7")).await?;
+
+        let (with_expiry,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM invite_codes WHERE expires_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(with_expiry, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoking_removes_an_unused_code_and_refuses_a_spent_one() -> Result<()> {
+        let pool = setup_pool().await?;
+        let now = Utc::now().timestamp();
+
+        sqlx::query("INSERT INTO invite_codes (code, created_at) VALUES ('SPENTONE', ?)")
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        db::add_user_with(
+            &pool,
+            "Bob",
+            "correct horse battery staple 7!",
+            Some("SPENTONE"),
+        )
+        .await?;
+        assert!(
+            dispatch_audited(&pool, "invite-revoke", Some("SPENTONE"))
+                .await
+                .is_err()
+        );
+
+        sqlx::query("INSERT INTO invite_codes (code, created_at) VALUES ('FRESHONE', ?)")
+            .bind(now)
+            .execute(&pool)
+            .await?;
+        dispatch_audited(&pool, "invite-revoke", Some("FRESHONE")).await?;
+
+        let (left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM invite_codes")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(left, 1, "only the spent code may remain");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn every_command_leaves_exactly_one_audit_row() -> Result<()> {
         for command in [
@@ -615,7 +758,7 @@ mod tests {
     #[test]
     fn the_temporary_password_would_pass_registration() {
         for _ in 0..64 {
-            let password = temporary_password();
+            let password = random_code();
             let score = zxcvbn::zxcvbn(&password, &[]).score();
             assert!(
                 score >= Score::Three,

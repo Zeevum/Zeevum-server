@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::connection;
 use crate::db;
 use crate::hub::Hub;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{MAX_TRACKED_IPS, RateLimiter};
 use crate::tls;
 
 /// Cheap to clone, the expensive parts are already shared behind an `Arc`
@@ -33,11 +33,18 @@ impl AppContext {
         let fake_hash = db::hash_password("fake_password_for_timing_attack")
             .context("Failed to generate fake hash")?;
 
+        // Built before `config` moves into its Arc, it reads the limits.
+        let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(
+            config.reg_per_ip_per_hour as usize,
+            config.conn_per_ip_per_10s as usize,
+            MAX_TRACKED_IPS,
+        )));
+
         Ok(Self {
             config: Arc::new(config),
             pool,
             hub: Hub::new(),
-            rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+            rate_limiter,
             fake_hash: Arc::new(fake_hash),
         })
     }

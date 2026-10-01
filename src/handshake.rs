@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use zeevum_protocol::{AuthMethod, ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, decode, pow};
 
+use crate::config::RegistrationMode;
 use crate::db;
 use crate::frames::{frame, read_frame};
 use crate::server::AppContext;
@@ -78,7 +80,57 @@ pub async fn handshake(
     }
 
     let method = match method {
-        AuthMethod::Register { login, password } => {
+        AuthMethod::Register {
+            login,
+            password,
+            invite_code,
+        } => {
+            // L2: an address that has created its accounts for the window
+            // does not get to spend proof-of-work on a registration that
+            // will be refused anyway.
+            if ctx
+                .rate_limiter
+                .lock()
+                .unwrap()
+                .registration_blocked(peer.ip(), Instant::now())
+            {
+                return Err(Auth(
+                    ErrorCode::RegistrationFailed,
+                    "registration rate limit reached for this address".into(),
+                ));
+            }
+
+            // The same reasoning for the mode and the code: a refusal is
+            // cheap here and expensive after the challenge. The code value
+            // itself never reaches the log.
+            match ctx.config.registration {
+                RegistrationMode::Closed => {
+                    return Err(Auth(
+                        ErrorCode::RegistrationFailed,
+                        "registration is closed".into(),
+                    ));
+                }
+                RegistrationMode::Invite => {
+                    let code = invite_code
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty());
+                    let valid = match code {
+                        Some(code) => db::invite_code_valid(&ctx.pool, code)
+                            .await
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if !valid {
+                        return Err(Auth(
+                            ErrorCode::RegistrationFailed,
+                            "a valid invite code is required".into(),
+                        ));
+                    }
+                }
+                RegistrationMode::Open => {}
+            }
+
             let challenge = pow::generate_challenge();
             let bits = ctx.config.pow_difficulty.bits();
 
@@ -117,7 +169,11 @@ pub async fn handshake(
                     "proof of work did not verify".into(),
                 ));
             }
-            AuthMethod::Register { login, password }
+            AuthMethod::Register {
+                login,
+                password,
+                invite_code,
+            }
         }
         m => m,
     };
@@ -133,9 +189,37 @@ pub async fn handshake(
                 .await
                 .map(AuthOutcome::NewSession)
         }
-        AuthMethod::Register { login, password } => register_user(&ctx.pool, &login, &password)
-            .await
-            .map(AuthOutcome::NewSession),
+        AuthMethod::Register {
+            login,
+            password,
+            invite_code,
+        } => {
+            let invite = match ctx.config.registration {
+                RegistrationMode::Open => None,
+                RegistrationMode::Invite => invite_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty()),
+                // Rejected before the proof of work; kept here so that no
+                // future path around that check lets a registration through.
+                RegistrationMode::Closed => {
+                    return Err(Auth(
+                        ErrorCode::RegistrationFailed,
+                        "registration is closed".into(),
+                    ));
+                }
+            };
+            let outcome = register_user(&ctx.pool, &login, &password, invite).await;
+            // L2 counts accounts that exist afterwards, not attempts: a
+            // registration refused for a taken login was free.
+            if outcome.is_ok() {
+                ctx.rate_limiter
+                    .lock()
+                    .unwrap()
+                    .record_registration(peer.ip(), Instant::now());
+            }
+            outcome.map(AuthOutcome::NewSession)
+        }
     };
 
     outcome.map_err(|(code, detail)| Auth(code, detail))
@@ -161,8 +245,9 @@ async fn register_user(
     pool: &sqlx::SqlitePool,
     login: &str,
     password: &str,
+    invite: Option<&str>,
 ) -> Result<db::User, (ErrorCode, String)> {
-    match db::add_user(pool, login, password).await {
+    match db::add_user_with(pool, login, password, invite).await {
         Ok(user) => Ok(user),
         Err(e) => {
             warning!("Registration failed for '{login}': {e}");

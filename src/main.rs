@@ -6,7 +6,15 @@ use zeevum_server::{AppContext, Config, db, error, info, logger, serve, warning}
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    // Relative paths inside .env are relative to the file itself, so the
+    // same value means the same database whether the binary was started by
+    // `cargo run` from the project or by hand out of target/release.
+    if let Some(dir) = dotenvy::dotenv()
+        .ok()
+        .and_then(|file| file.parent().map(|p| p.to_path_buf()))
+    {
+        zeevum_server::config::set_env_dir(dir);
+    }
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
