@@ -6,6 +6,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use zeevum_protocol::{AuthMethod, ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, decode, pow};
 
+use tracing::{debug, warn};
+
 use crate::config::RegistrationMode;
 use crate::db;
 use crate::frames::{frame, read_frame};
@@ -250,7 +252,7 @@ async fn register_user(
     match db::add_user_with(pool, login, password, invite).await {
         Ok(user) => Ok(user),
         Err(e) => {
-            warning!("Registration failed for '{login}': {e}");
+            warn!("Registration failed for '{login}': {e}");
             Err((
                 ErrorCode::RegistrationFailed,
                 "login taken, malformed, or password too weak".into(),

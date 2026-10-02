@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use zeevum_server::{AppContext, Config, db, error, info, logger, serve, warning};
+use tracing::{error, info, warn};
+use zeevum_server::{AppContext, Config, db, logger, serve};
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +26,6 @@ async fn main() {
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
-        logger::shutdown();
         std::process::exit(0);
     });
 
@@ -35,7 +35,6 @@ async fn main() {
     if args.first().map(|s| s.as_str()) == Some("admin") {
         if let Err(e) = zeevum_server::admin::run(&args[1..]).await {
             error!("{e:#}");
-            logger::shutdown();
             std::process::exit(1);
         }
         return;
@@ -56,7 +55,6 @@ async fn main() {
 
     if let Err(e) = run(config).await {
         error!("Fatal error: {e:#}");
-        logger::shutdown();
         std::process::exit(1);
     }
 }
@@ -84,7 +82,7 @@ fn spawn_session_gc(pool: sqlx::SqlitePool) -> oneshot::Sender<()> {
                 _ = ticker.tick() => match db::delete_expired_sessions(&pool).await {
                     Ok(0) => {}
                     Ok(n) => info!("Deleted {n} expired sessions"),
-                    Err(e) => warning!("Failed to delete expired sessions: {e}"),
+                    Err(e) => warn!("Failed to delete expired sessions: {e}"),
                 },
                 _ = &mut stop_rx => break,
             }

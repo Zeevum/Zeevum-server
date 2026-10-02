@@ -6,6 +6,8 @@
 use uuid::Uuid;
 use zeevum_protocol::{ClientMsg, ErrorCode, MAX_MESSAGE_LEN, ServerMsg, UserBrief};
 
+use tracing::{error, warn};
+
 use crate::db;
 use crate::db::FriendReqOutcome;
 use crate::frames::frame;
@@ -179,12 +181,12 @@ pub async fn dispatch(cmd: ClientMsg, user: &db::User, ctx: &AppContext, token: 
 
     match cmd {
         ClientMsg::Auth { .. } => {
-            warning!("Unexpected Auth frame from {}", user.login);
+            warn!("Unexpected Auth frame from {}", user.login);
             Flow::Disconnect
         }
 
         ClientMsg::PowSolution { .. } => {
-            warning!("Unexpected PowSolution frame from {}", user.login);
+            warn!("Unexpected PowSolution frame from {}", user.login);
             Flow::Disconnect
         }
 

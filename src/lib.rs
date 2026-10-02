@@ -4,7 +4,6 @@
 //! Everything else lives here so that integration tests can start a real
 //! server on an ephemeral port with their own database and certificates.
 
-#[macro_use]
 pub mod logger;
 
 pub mod admin;

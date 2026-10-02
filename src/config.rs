@@ -1,10 +1,12 @@
-use crate::{db, logger};
+use crate::db;
 use std::{
     env,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Duration,
 };
+use tracing::level_filters::LevelFilter;
+use tracing::trace;
 use zeevum_protocol::pow::Difficulty;
 
 /// Where the `.env` was found, when there was one. A relative path written
@@ -63,7 +65,7 @@ pub struct Config {
     pub msg_per_sec: u32,
     pub conn_per_ip_per_10s: u32,
     pub registration: RegistrationMode,
-    pub log_level: logger::LogLevel,
+    pub log_level: LevelFilter,
 }
 
 impl Config {
@@ -96,20 +98,20 @@ impl Config {
     /// Kept apart from the rest for the same reason as the database path:
     /// `admin` has to be able to start a log without first having everything
     /// a server needs.
-    pub fn log_level_from_env() -> logger::LogLevel {
+    pub fn log_level_from_env() -> LevelFilter {
         match env::var("LOG_LEVEL")
             .unwrap_or_default()
             .to_uppercase()
             .as_str()
         {
-            "TRACE" => logger::LogLevel::Trace,
-            "DEBUG" => logger::LogLevel::Debug,
-            "INFO" | "" => logger::LogLevel::Info,
-            "WARN" | "WARNING" => logger::LogLevel::Warning,
-            "ERROR" => logger::LogLevel::Error,
+            "TRACE" => LevelFilter::TRACE,
+            "DEBUG" => LevelFilter::DEBUG,
+            "INFO" | "" => LevelFilter::INFO,
+            "WARN" | "WARNING" => LevelFilter::WARN,
+            "ERROR" => LevelFilter::ERROR,
             unknown => {
                 eprintln!("Unknown LOG_LEVEL value '{unknown}', falling back to INFO");
-                logger::LogLevel::Info
+                LevelFilter::INFO
             }
         }
     }

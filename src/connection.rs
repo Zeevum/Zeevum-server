@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use zeevum_protocol::{ClientMsg, ErrorCode, ServerMsg, UnreadEntry, UserBrief, decode};
 
+use tracing::{Instrument, error, info, trace, warn};
+
 use crate::db;
 use crate::frames::{frame, read_frame};
 use crate::handlers::{self, Flow};
@@ -31,11 +33,11 @@ pub async fn handle_client(
         let mut limiter = ctx.rate_limiter.lock().unwrap();
         let now = Instant::now();
         if !limiter.connection_allowed(peer_ip, now) {
-            warning!("Connection from {peer_address} cut: too many connections from this address");
+            warn!("Connection from {peer_address} cut: too many connections from this address");
             return;
         }
         if limiter.handshake_blocked(peer_ip, now) {
-            warning!("Connection from {peer_address} blocked due to rate limit");
+            warn!("Connection from {peer_address} blocked due to rate limit");
             return;
         }
     }
@@ -47,7 +49,7 @@ pub async fn handle_client(
     let mut tls_stream = match tls_acceptor.accept(stream).await {
         Ok(s) => s,
         Err(e) => {
-            warning!("TLS handshake failed for {peer_address}: {e}");
+            warn!("TLS handshake failed for {peer_address}: {e}");
             return;
         }
     };
@@ -61,7 +63,7 @@ pub async fn handle_client(
             o
         }
         Err(e) => {
-            warning!(
+            warn!(
                 "Handshake failed for {peer_address}: [{}] {}",
                 e.code(),
                 e.detail()
@@ -114,99 +116,109 @@ pub async fn handle_client(
         handshake::AuthOutcome::ReusedSession(user, token, expires_at) => (user, token, expires_at),
     };
 
-    // Ties this connection to its row in `sessions`, Logout needs it to revoke the right one.
-    let session_token = token.clone();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let tx_cleanup = tx.clone();
-    // Lets the hub close this connection, which "log out everywhere" needs, without
-    // a signal the read loop would sit in read_frame until the client spoke.
-    let (kick_tx, mut kick_rx) = tokio::sync::watch::channel(false);
-    ctx.hub.register(user.user_id, tx, kick_tx);
-
-    let (reader, mut writer) = split(tls_stream);
-    let mut reader = AsyncBufReader::new(reader);
-
-    info!("User {} ({}) entered main loop", user.login, peer_address);
-
-    let write_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if writer.write_all(message.as_bytes()).await.is_err() {
-                break;
-            }
-            if writer.flush().await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let user_login = user.login.clone();
-
-    let _ = ctx.hub.send_to(
-        user.user_id,
-        &frame(&ServerMsg::AuthOk {
-            user_id: user.user_id,
-            token,
-            expires_at,
-            must_change_password: user.must_change_password,
-        }),
+    // Everything from here on belongs to one user, and every line it logs
+    // carries that, so concurrent connections are readable apart.
+    let span = tracing::info_span!(
+        "conn",
+        login = %user.login,
+        user_id = user.user_id,
+        peer = %peer_address,
     );
 
-    match db::get_friends_list(&ctx.pool, &user.id).await {
-        Ok(friends) => {
-            let entries = friends
-                .into_iter()
-                .map(|(user_id, login)| UserBrief { user_id, login })
-                .collect();
-            let _ = ctx
-                .hub
-                .send_to(user.user_id, &frame(&ServerMsg::FriendList { entries }));
+    async {
+        // Ties this connection to its row in `sessions`, Logout needs it to revoke the right one.
+        let session_token = token.clone();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let tx_cleanup = tx.clone();
+        // Lets the hub close this connection, which "log out everywhere" needs, without
+        // a signal the read loop would sit in read_frame until the client spoke.
+        let (kick_tx, mut kick_rx) = tokio::sync::watch::channel(false);
+        ctx.hub.register(user.user_id, tx, kick_tx);
+
+        let (reader, mut writer) = split(tls_stream);
+        let mut reader = AsyncBufReader::new(reader);
+
+        info!("User {} ({}) entered main loop", user.login, peer_address);
+
+        let write_task = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if writer.write_all(message.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let user_login = user.login.clone();
+
+        let _ = ctx.hub.send_to(
+            user.user_id,
+            &frame(&ServerMsg::AuthOk {
+                user_id: user.user_id,
+                token,
+                expires_at,
+                must_change_password: user.must_change_password,
+            }),
+        );
+
+        match db::get_friends_list(&ctx.pool, &user.id).await {
+            Ok(friends) => {
+                let entries = friends
+                    .into_iter()
+                    .map(|(user_id, login)| UserBrief { user_id, login })
+                    .collect();
+                let _ = ctx
+                    .hub
+                    .send_to(user.user_id, &frame(&ServerMsg::FriendList { entries }));
+            }
+            Err(e) => error!("Failed to load friend list for {user_login}: {e}"),
         }
-        Err(e) => error!("Failed to load friend list for {user_login}: {e}"),
-    }
 
-    match db::get_pending_requests(&ctx.pool, &user.id).await {
-        Ok(reqs) => {
-            let entries = reqs
-                .into_iter()
-                .map(|(user_id, login)| UserBrief { user_id, login })
-                .collect();
-            let _ = ctx
-                .hub
-                .send_to(user.user_id, &frame(&ServerMsg::PendingReqs { entries }));
+        match db::get_pending_requests(&ctx.pool, &user.id).await {
+            Ok(reqs) => {
+                let entries = reqs
+                    .into_iter()
+                    .map(|(user_id, login)| UserBrief { user_id, login })
+                    .collect();
+                let _ = ctx
+                    .hub
+                    .send_to(user.user_id, &frame(&ServerMsg::PendingReqs { entries }));
+            }
+            Err(e) => error!("Failed to load pending requests for {user_login}: {e}"),
         }
-        Err(e) => error!("Failed to load pending requests for {user_login}: {e}"),
-    }
 
-    // After the friend list, never before it. The client empties its counts
-    // when the list arrives, so a summary sent first would be wiped.
-    match db::unread_summary(&ctx.pool, &user.id).await {
-        Ok(rows) => {
-            let entries = rows
-                .into_iter()
-                .map(|row| UnreadEntry {
-                    conv_id: row.conv_id,
-                    peer: UserBrief {
-                        user_id: row.peer_user_id,
-                        login: row.peer_login,
-                    },
-                    count: row.count as u32,
-                })
-                .collect();
-            let _ = ctx
-                .hub
-                .send_to(user.user_id, &frame(&ServerMsg::UnreadSummary { entries }));
+        // After the friend list, never before it. The client empties its counts
+        // when the list arrives, so a summary sent first would be wiped.
+        match db::unread_summary(&ctx.pool, &user.id).await {
+            Ok(rows) => {
+                let entries = rows
+                    .into_iter()
+                    .map(|row| UnreadEntry {
+                        conv_id: row.conv_id,
+                        peer: UserBrief {
+                            user_id: row.peer_user_id,
+                            login: row.peer_login,
+                        },
+                        count: row.count as u32,
+                    })
+                    .collect();
+                let _ = ctx
+                    .hub
+                    .send_to(user.user_id, &frame(&ServerMsg::UnreadSummary { entries }));
+            }
+            Err(e) => error!("Failed to load unread counts for {user_login}: {e}"),
         }
-        Err(e) => error!("Failed to load unread counts for {user_login}: {e}"),
-    }
 
-    // L3: frames per connection. It lives here, in the connection, because
-    // two connections of one user are two buckets, and none of this needs
-    // a lock.
-    let mut bucket = TokenBucket::new(ctx.config.msg_burst, ctx.config.msg_per_sec);
+        // L3: frames per connection. It lives here, in the connection, because
+        // two connections of one user are two buckets, and none of this needs
+        // a lock.
+        let mut bucket = TokenBucket::new(ctx.config.msg_burst, ctx.config.msg_per_sec);
 
-    loop {
-        let frame_res = tokio::select! {
+        loop {
+            let frame_res = tokio::select! {
             res = tokio::time::timeout(ctx.config.read_timeout, read_frame(&mut reader)) => res,
             // Revoked from the outside, the read future is dropped mid-flight.
             _ = kick_rx.changed() => {
@@ -215,92 +227,95 @@ pub async fn handle_client(
             }
         };
 
-        match frame_res {
-            Err(_) => {
-                warning!("Read timeout for {peer_address} ({user_login})");
-                break;
-            }
-            Ok(Err(e)) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    trace!(
-                        "Client {peer_address} ({user_login}) dropped connection without TLS close_notify"
-                    );
-                } else {
-                    warning!("Error reading from {peer_address} ({user_login}): {e}");
-                }
-                break;
-            }
-            Ok(Ok(line)) => {
-                if !line.ends_with('\n') {
-                    trace!("Connection {peer_address} ({user_login}) closed mid-frame");
+            match frame_res {
+                Err(_) => {
+                    warn!("Read timeout for {peer_address} ({user_login})");
                     break;
                 }
-
-                let payload = line.trim();
-                if payload.is_empty() {
-                    continue;
-                }
-                trace!("Frame from {user_login}: {} bytes", payload.len());
-
-                let cmd: ClientMsg = match decode(payload) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        warning!("Malformed frame from {user_login}, dropping connection");
-                        break;
-                    }
-                };
-
-                // The frame pays its token before it is allowed to cost a
-                // database write. A locked account pays too: ChangePassword
-                // spam is still spam.
-                match bucket.verdict(Instant::now()) {
-                    Verdict::Now => {}
-                    Verdict::Wait(how_long) => tokio::time::sleep(how_long).await,
-                    Verdict::Cut => {
-                        warning!("Cutting {peer_address} ({user_login}): frame flood");
-                        break;
-                    }
-                }
-
-                // A password that has to be replaced locks the account until
-                // it is. Checked here, in front of the dispatch and not
-                // inside it, so that there is no way past: not by sending
-                // some other frame first, and not through a handler that
-                // forgets to guard itself.
-                if user.must_change_password && !is_change_password(&cmd) {
-                    let _ = ctx.hub.send_to(
-                        user.user_id,
-                        &frame(&ServerMsg::Error {
-                            code: ErrorCode::MustChangePassword,
-                            detail: None,
-                        }),
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        trace!(
+                        "Client {peer_address} ({user_login}) dropped connection without TLS close_notify"
                     );
-                    continue;
+                    } else {
+                        warn!("Error reading from {peer_address} ({user_login}): {e}");
+                    }
+                    break;
                 }
+                Ok(Ok(line)) => {
+                    if !line.ends_with('\n') {
+                        trace!("Connection {peer_address} ({user_login}) closed mid-frame");
+                        break;
+                    }
 
-                let changed = is_change_password(&cmd);
+                    let payload = line.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    trace!("Frame from {user_login}: {} bytes", payload.len());
 
-                match handlers::dispatch(cmd, &user, &ctx, &session_token).await {
-                    Flow::Continue => {
-                        if changed {
-                            // Read back rather than assumed: the database is
-                            // the only thing that knows whether the lock is
-                            // gone, and failing closed keeps it.
-                            user.must_change_password =
-                                db::must_change_password(&ctx.pool, user.id)
-                                    .await
-                                    .unwrap_or(true);
+                    let cmd: ClientMsg = match decode(payload) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            warn!("Malformed frame from {user_login}, dropping connection");
+                            break;
+                        }
+                    };
+
+                    // The frame pays its token before it is allowed to cost a
+                    // database write. A locked account pays too: ChangePassword
+                    // spam is still spam.
+                    match bucket.verdict(Instant::now()) {
+                        Verdict::Now => {}
+                        Verdict::Wait(how_long) => tokio::time::sleep(how_long).await,
+                        Verdict::Cut => {
+                            warn!("Cutting {peer_address} ({user_login}): frame flood");
+                            break;
                         }
                     }
-                    Flow::Disconnect => break,
+
+                    // A password that has to be replaced locks the account until
+                    // it is. Checked here, in front of the dispatch and not
+                    // inside it, so that there is no way past: not by sending
+                    // some other frame first, and not through a handler that
+                    // forgets to guard itself.
+                    if user.must_change_password && !is_change_password(&cmd) {
+                        let _ = ctx.hub.send_to(
+                            user.user_id,
+                            &frame(&ServerMsg::Error {
+                                code: ErrorCode::MustChangePassword,
+                                detail: None,
+                            }),
+                        );
+                        continue;
+                    }
+
+                    let changed = is_change_password(&cmd);
+
+                    match handlers::dispatch(cmd, &user, &ctx, &session_token).await {
+                        Flow::Continue => {
+                            if changed {
+                                // Read back rather than assumed: the database is
+                                // the only thing that knows whether the lock is
+                                // gone, and failing closed keeps it.
+                                user.must_change_password =
+                                    db::must_change_password(&ctx.pool, user.id)
+                                        .await
+                                        .unwrap_or(true);
+                            }
+                        }
+                        Flow::Disconnect => break,
+                    }
                 }
             }
         }
-    }
 
-    ctx.hub.unregister_if(user.user_id, &tx_cleanup);
-    write_task.abort();
-    trace!("Connection finished for: {peer_address} ({user_login})");
+        ctx.hub.unregister_if(user.user_id, &tx_cleanup);
+        write_task.abort();
+        trace!("Connection finished for: {peer_address} ({user_login})");
+    }
+        .instrument(span)
+        .await;
 }
 
 /// The one frame a locked account is allowed to send.

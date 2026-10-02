@@ -1,210 +1,222 @@
+//! Logging on `tracing`, in the shape the server always printed: a colored
+//! console line and a daily file, both `[LEVEL] timestamp - message`, with
+//! the span of the connection in front of the message.
+//!
+//! Events are written synchronously, an event is on disk by the time its
+//! call returns, so an exit cannot lose the last lines the way a queue and
+//! a writer thread could.
+
 use chrono::Local;
 use colored::Colorize;
+use std::fmt::{self, Write as FmtWrite};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::Write as IoWrite;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock, mpsc};
-use std::thread;
+use std::sync::{Mutex, MutexGuard};
+use tracing::Level;
+use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{
+    FmtContext, FormatEvent, FormatFields, FormattedFields, Layer, MakeWriter,
+};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warning,
-    Error,
-    #[allow(dead_code)]
-    Fatal,
+/// Sets up the process-wide subscriber. Must be called first in `main`;
+/// the admin branch and the server branch share it.
+pub fn init(app_name: &str, min_level: LevelFilter) {
+    let console = Layer::default()
+        .with_ansi(false)
+        .event_format(ZeevumFormat { colored: true });
+    let file = Layer::default()
+        .with_ansi(false)
+        .with_writer(DailyFile::new(app_name))
+        .event_format(ZeevumFormat { colored: false });
+
+    tracing_subscriber::registry()
+        .with(min_level)
+        .with(console)
+        .with(file)
+        .init();
 }
 
-impl LogLevel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Trace => "TRACE",
-            LogLevel::Debug => "DEBUG",
-            LogLevel::Info => "INFO",
-            LogLevel::Warning => "WARN",
-            LogLevel::Error => "ERROR",
-            LogLevel::Fatal => "FATAL",
+/// `[LEVEL] timestamp - [spans: ] message`, the line the server always
+/// wrote, now with the span chain of the event in front of the message.
+struct ZeevumFormat {
+    colored: bool,
+}
+
+/// Pulls the fields out of an event: the message on its own, everything
+/// else as `key=value`, so an event without a message still says what it
+/// carried instead of printing an empty line.
+struct Fields {
+    message: String,
+    rest: String,
+}
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            let _ = write!(self.rest, "{}={value:?} ", field.name());
         }
     }
 }
 
-impl std::fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
+impl<S, N> FormatEvent<S, N> for ZeevumFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut fields = Fields {
+            message: String::new(),
+            rest: String::new(),
+        };
+        event.record(&mut fields);
+        let text = if fields.rest.is_empty() {
+            fields.message
+        } else {
+            format!("{} {}", fields.message, fields.rest.trim_end())
+        };
 
-struct LogEntry {
-    level: LogLevel,
-    content: String,
-}
-
-static LOG_SENDER: OnceLock<Mutex<Option<mpsc::Sender<LogEntry>>>> = OnceLock::new();
-static LOG_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
-static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
-
-/// Initializes the logger. Must be called first in `main`
-pub fn init(app_name: &str, min_level: LogLevel) {
-    let app_lowercase = app_name.to_lowercase();
-    LOG_LEVEL.set(min_level).ok();
-
-    let (tx, rx) = mpsc::channel::<LogEntry>();
-    LOG_SENDER.set(Mutex::new(Some(tx))).ok();
-
-    let log_dir = get_log_dir(app_name);
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        eprintln!("Failed to create log directory: {e}");
-    }
-
-    let handle = thread::Builder::new()
-        .name("LoggerThread".into())
-        .spawn(move || {
-            let mut current_day = String::new();
-            let mut file: Option<File> = None;
-
-            for entry in rx {
-                let now = Local::now();
-                let day_str = now.format("%Y-%m-%d").to_string();
-
-                if day_str != current_day {
-                    current_day = day_str;
-                    let path = log_dir.join(format!("{}_{}.log", app_lowercase, current_day));
-                    file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .ok();
-                }
-
-                let timestamp = now.format("%Y-%m-%d %H:%M:%S.%f");
-                let file_line = format!("[{:<5}] {} - {}", entry.level, timestamp, entry.content);
-
-                if let Some(f) = file.as_mut()
-                    && let Err(e) = writeln!(f, "{}", file_line)
-                {
-                    eprintln!("Failed to write to log file: {e}");
-                }
-
-                let console_str = format!(
-                    "[{:<5}] {} - {}",
-                    entry.level.to_string().bold(),
-                    timestamp,
-                    entry.content
+        let mut spans = String::new();
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope.from_root() {
+                let _ = write!(
+                    spans,
+                    "{}{{{}}}: ",
+                    span.metadata().name(),
+                    span.extensions()
+                        .get::<FormattedFields<N>>()
+                        .map(|f| f.fields.as_str())
+                        .unwrap_or("")
                 );
-                match entry.level {
-                    LogLevel::Trace => println!("{}", console_str.bright_black()),
-                    LogLevel::Debug => println!("{}", console_str.bright_green()),
-                    LogLevel::Info => println!("{}", console_str.bright_blue()),
-                    LogLevel::Warning => println!("{}", console_str.yellow()),
-                    LogLevel::Error => println!("{}", console_str.bright_red()),
-                    LogLevel::Fatal => println!("{}", console_str.red().bold().on_black()),
-                }
             }
-        })
-        .expect("Failed to spawn logger thread");
-    LOG_THREAD.set(Mutex::new(Some(handle))).ok();
-}
+        }
 
-/// The logger writes from its own thread, so `std::process::exit` drops
-/// whatever is still in the queue, which is how the last line before an
-/// exit went missing. Dropping the sender ends the loop and joining waits
-/// for it to drain.
-pub fn shutdown() {
-    if let Some(slot) = LOG_SENDER.get()
-        && let Ok(mut guard) = slot.lock()
-    {
-        *guard = None;
-    }
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S.%f");
+        let line = format!(
+            "[{:<5}] {timestamp} - {spans}{text}",
+            event.metadata().level()
+        );
 
-    if let Some(slot) = LOG_THREAD.get()
-        && let Ok(mut guard) = slot.lock()
-        && let Some(handle) = guard.take()
-    {
-        let _ = handle.join();
+        if self.colored {
+            match *event.metadata().level() {
+                Level::TRACE => writeln!(writer, "{}", line.bright_black()),
+                Level::DEBUG => writeln!(writer, "{}", line.bright_green()),
+                Level::INFO => writeln!(writer, "{}", line.bright_blue()),
+                Level::WARN => writeln!(writer, "{}", line.yellow()),
+                Level::ERROR => writeln!(writer, "{}", line.bright_red()),
+            }
+        } else {
+            writeln!(writer, "{line}")
+        }
     }
 }
 
-fn get_log_dir(app_name: &str) -> PathBuf {
+/// One file per day, the path and name the server always used:
+/// `<data>/Zeevum/<app>/logs/<app>_YYYY-MM-DD.log`, appended. The handle
+/// is kept for the day, so an event costs one write and nothing more.
+struct DailyFile {
+    directory: PathBuf,
+    prefix: String,
+    today: Mutex<TodayFile>,
+}
+
+struct TodayFile {
+    day: String,
+    file: Option<File>,
+}
+
+impl DailyFile {
+    fn new(app_name: &str) -> Self {
+        Self {
+            directory: log_dir(app_name),
+            prefix: app_name.to_lowercase(),
+            today: Mutex::new(TodayFile {
+                day: String::new(),
+                file: None,
+            }),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for DailyFile {
+    type Writer = DailyWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let mut today = self.today.lock().unwrap();
+        let day = Local::now().format("%Y-%m-%d").to_string();
+        if today.day != day {
+            if std::fs::create_dir_all(&self.directory).is_ok() {
+                today.file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.directory.join(format!("{}_{}.log", self.prefix, day)))
+                    .ok();
+            }
+            today.day = day;
+        }
+        DailyWriter { today }
+    }
+}
+
+struct DailyWriter<'a> {
+    today: MutexGuard<'a, TodayFile>,
+}
+
+impl IoWrite for DailyWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.today.file.as_mut() {
+            Some(file) => file.write(buf),
+            // No file, no message; dropping it is better than failing the
+            // caller over a log line.
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.today.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+fn log_dir(app_name: &str) -> PathBuf {
     let base_dir = if cfg!(target_os = "windows") {
         std::env::var("APPDATA")
             .map(|p| PathBuf::from(p.replace("Roaming", "LocalLow")))
             .unwrap_or_else(|_| PathBuf::from("."))
+    } else if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".local/share")
     } else {
-        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-            PathBuf::from(xdg)
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".local/share")
-        } else {
-            PathBuf::from(".")
-        }
+        PathBuf::from(".")
     };
 
     base_dir.join("Zeevum").join(app_name).join("logs")
 }
 
-pub fn log(content: String, level: LogLevel) {
-    if let Some(min_level) = LOG_LEVEL.get()
-        && level < *min_level
-    {
-        return;
+#[cfg(test)]
+mod tests {
+    /// The level column keeps its width, the format stays greppable the way
+    /// it has always been.
+    #[test]
+    fn the_level_column_keeps_its_width() {
+        assert_eq!(format!("[{:<5}]", "INFO"), "[INFO ]");
+        assert_eq!(format!("[{:<5}]", "WARN"), "[WARN ]");
+        assert_eq!(format!("[{:<5}]", "ERROR"), "[ERROR]");
     }
-
-    let Some(slot) = LOG_SENDER.get() else {
-        eprintln!("[{level}] (FALLBACK) {content}");
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        eprintln!("[{level}] (FALLBACK) {content}");
-        return;
-    };
-    match slot.as_ref() {
-        Some(sender) => {
-            let _ = sender.send(LogEntry { level, content });
-        }
-        None => eprintln!("[{level}] (FALLBACK) {content}"),
-    }
-}
-
-#[macro_export]
-macro_rules! trace {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Trace)
-    };
-}
-
-#[macro_export]
-macro_rules! info {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Info)
-    };
-}
-
-#[macro_export]
-macro_rules! debug {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Debug)
-    };
-}
-
-#[macro_export]
-macro_rules! warning {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Warning)
-    };
-}
-
-#[macro_export]
-macro_rules! error {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Error)
-    };
-}
-
-#[macro_export]
-macro_rules! fatal {
-    ($($arg:tt)*) => {
-        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Fatal)
-    };
 }

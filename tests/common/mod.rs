@@ -19,8 +19,8 @@ use zeevum_protocol::{
     AuthMethod, ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, decode, encode, pow,
 };
 
+use tracing::level_filters::LevelFilter;
 use zeevum_server::config::RegistrationMode;
-use zeevum_server::logger::LogLevel;
 use zeevum_server::{AppContext, Config, serve};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,7 +49,7 @@ impl TestServer {
             // The binary does this in `main`, a test binary has to do it itself.
             let _ = rustls::crypto::ring::default_provider().install_default();
             // Without init the logger falls back to stderr at every level.
-            zeevum_server::logger::init("Zeevum-server-test", LogLevel::Error);
+            zeevum_server::logger::init("Zeevum-server-test", LevelFilter::ERROR);
         });
 
         let dir = TempDir::new().expect("failed to create temp dir");
@@ -86,7 +86,7 @@ impl TestServer {
             msg_per_sec: 1000,
             conn_per_ip_per_10s: 1000,
             registration: RegistrationMode::Open,
-            log_level: LogLevel::Error,
+            log_level: LevelFilter::ERROR,
         };
         tune(&mut config);
 
